@@ -8,3 +8,7 @@ mkdir -p build
 
 nvcc -arch=sm_80 -O3 -o build/bandwidth_pcie bandwidth_pcie.cu
 ./build/bandwidth_pcie
+
+nvcc -arch=sm_80 -O3 -o build/bandwidth_hbm bandwidth_hbm.cu
+./build/bandwidth_hbm
+
