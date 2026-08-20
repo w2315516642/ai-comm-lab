@@ -1,0 +1,2 @@
+# 入库时统一转成 LF,避免 Windows 复制进来的 CRLF 污染仓库
+* text=auto
