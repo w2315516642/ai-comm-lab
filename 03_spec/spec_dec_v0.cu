@@ -54,7 +54,8 @@ __global__ void spec_dec_kernel(
     float local = 0.0f;
 
     // 计算概率和（包括被拒绝时的非归一化情况）
-    int seq_ptr = (b_ptr + rej_id[0]) * V;
+    int pos = is_reject ? rej_id[0] : T - 1;
+    int seq_ptr = (b_ptr + pos) * V;
     for (int i = tid; i < V; i += blockDim.x) {
         float d_probs = is_reject ? draft_probs[seq_ptr + i] : 0.0f;
         float diff = target_probs[seq_ptr + i] - d_probs;
@@ -100,13 +101,13 @@ __global__ void spec_dec_kernel(
         int sampled_pos = is_reject ? rej_id[0] : T - 1;
         seq_ptr = (b_ptr + sampled_pos) * V;
         if (tid == 0) {
-            float prefix = 0;
+            double prefix = 0;
             float u = uniform_samples[u_ptr + T] * local;
             for (int i = 0; i < V; i++) {
                 float d_probs = is_reject ? draft_probs[seq_ptr + i] : 0.0f;
                 float diff = target_probs[seq_ptr + i] - d_probs;
-                prefix += fmax(0.0f, diff);
-                if (prefix >= u) {
+                prefix += (double)(fmax(0.0f, diff));
+                if (prefix >= (double)u) {
                     sampled_token[0] = i;
                     break;
                 }

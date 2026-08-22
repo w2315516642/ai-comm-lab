@@ -6,6 +6,7 @@
 //
 // 每次改动算子后重编译即可,新增版本文件只需在注册表里加一行。
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@ struct Impl {
 static const Impl kImpls[] = {
     {"v0-baseline", solve_v0},
     {"v1-approved", solve_v1},
+    {"v2-vector", solve_v2},
     {"ans0", solve_ans0},
     {"ans1", solve_ans1},
     // {"v1-xxx", solve_v1},
@@ -65,6 +67,85 @@ static void fill_probs(float *arr, int rows, int V, unsigned *seed) {
         }
         for (int i = 0; i < V; i++)
             arr[r * V + i] /= sum;
+    }
+}
+
+// 独立的 CPU 参考实现。不要拿某个 GPU 版本当 oracle，否则基准版本的
+// bug 会被其他版本一起继承，最终仍然显示 PASS。
+static void reference_cpu(
+    const int *draft,
+    const float *p,
+    const float *q,
+    const float *u,
+    int *out,
+    int B,
+    int T,
+    int V
+) {
+    for (int b = 0; b < B; b++) {
+        int reject = T;
+        for (int t = 0; t < T; t++) {
+            int token = draft[b * T + t];
+            int idx = (b * T + t) * V + token;
+            float rate = fminf(1.0f, q[idx] / p[idx]);
+            if (u[b * (T + 1) + t] >= rate) {
+                reject = t;
+                break;
+            }
+        }
+
+        const bool rejected = reject < T;
+        const int row = b * T + (rejected ? reject : T - 1);
+        float total = 0.0f;
+        for (int v = 0; v < V; v++) {
+            float weight =
+                rejected ? q[row * V + v] - p[row * V + v] : q[row * V + v];
+            total += fmaxf(0.0f, weight);
+        }
+
+        int sampled = 0;
+        if (rejected && total <= 0.0f) {
+            int candidate = (int)(u[b * (T + 1) + T] * V);
+            sampled = candidate < 0 ? 0 : (candidate >= V ? V - 1 : candidate);
+        } else {
+            // 与 kernel 一样先用 float 计算采样目标；仅把长 CDF 的
+            // 累加提升到 double，避免串行 float 累计误差。
+            float needle = u[b * (T + 1) + T] * total;
+            float prefix = 0.0f;
+            for (int v = 0; v < V; v++) {
+                float weight =
+                    rejected ? q[row * V + v] - p[row * V + v] : q[row * V + v];
+                prefix += fmaxf(0.0f, weight);
+                if (prefix >= needle) {
+                    sampled = v;
+                    break;
+                }
+            }
+        }
+
+        for (int t = 0; t < T + 1; t++) {
+            int value = t < reject ? draft[b * T + t] : 0;
+            out[b * (T + 1) + t] = t == reject ? sampled : value;
+        }
+    }
+}
+
+static void print_first_mismatch(
+    const char *name, const int *expected, const int *actual, int n, int T
+) {
+    for (int i = 0; i < n; i++) {
+        if (expected[i] != actual[i]) {
+            fprintf(
+                stderr,
+                "%s mismatch: batch=%d position=%d expected=%d actual=%d\n",
+                name,
+                i / (T + 1),
+                i % (T + 1),
+                expected[i],
+                actual[i]
+            );
+            return;
+        }
     }
 }
 
@@ -163,23 +244,23 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_u, h_u, sizeof(float) * B * (T + 1), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
 
-    // ---------- 正确性:所有版本输出必须和 v0 一致 ----------
-    kImpls[0].fn(d_draft, d_p, d_q, d_u, d_out, B, T, V);
-    if (cudaGetLastError() != cudaSuccess)
-        die("solve_v0 launch");
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_out, d_out, sizeof(int) * B * (T + 1), cudaMemcpyDeviceToHost);
-
+    // ---------- 正确性:所有版本分别和独立 CPU oracle 对比 ----------
+    reference_cpu(h_draft, h_p, h_q, h_u, h_out, B, T, V);
     bool correct[kNumImpls] = {true};
-    for (int k = 1; k < kNumImpls; k++) {
+    for (int k = 0; k < kNumImpls; k++) {
+        // 先写哨兵值，避免 kernel 漏写某些输出位置时碰巧沿用旧结果。
+        cudaMemset(d_out, 0xa5, sizeof(int) * B * (T + 1));
         kImpls[k].fn(d_draft, d_p, d_q, d_u, d_out, B, T, V);
         if (cudaGetLastError() != cudaSuccess)
             die("impl launch");
-        cudaDeviceSynchronize();
+        if (cudaDeviceSynchronize() != cudaSuccess)
+            die("impl execution");
         cudaMemcpy(
             h_out2, d_out, sizeof(int) * B * (T + 1), cudaMemcpyDeviceToHost
         );
         correct[k] = memcmp(h_out, h_out2, sizeof(int) * B * (T + 1)) == 0;
+        if (!correct[k])
+            print_first_mismatch(kImpls[k].name, h_out, h_out2, B * (T + 1), T);
     }
 
     // ---------- 计时对比 ----------

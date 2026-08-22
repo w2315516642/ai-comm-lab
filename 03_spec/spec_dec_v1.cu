@@ -13,6 +13,7 @@ __global__ void spec_dec_v1_kernel(
     int T,
     int V
 ) {
+    constexpr int NUM_WARPS = (THREAD_PER_BLOCK + 31) / 32;
     // 判断第一个被拒绝的 token
     int tid = threadIdx.x;
     int b_ptr = blockIdx.x * T;
@@ -21,19 +22,18 @@ __global__ void spec_dec_v1_kernel(
     __shared__ int reject_pos;
     __shared__ int sampled_token;
     __shared__ int chunk_idx;
-    __shared__ bool is_reject;
-    __shared__ float chunked_sum[THREAD_PER_BLOCK];
+    __shared__ float chunked_sum[NUM_WARPS];
     __shared__ float sum;
 
     if (tid == 0) {
         reject_pos = T;
         chunk_idx = THREAD_PER_BLOCK;
         sampled_token = 0;
-        is_reject = 0;
     }
 
     __syncthreads();
 
+    // tokens 数量需要小于线程数，不然这里有 bug
     if (tid < T) {
         // 1. 找到 draft token
         int dtoken_id = draft_tokens[b_ptr + tid];
@@ -50,7 +50,7 @@ __global__ void spec_dec_v1_kernel(
     __syncthreads();
 
     // 对被拒绝的那个进行重采样，否则直接对第 T+1 个进行额外采样
-    is_reject = reject_pos < T;
+    bool is_reject = reject_pos < T;
 
     // 计算概率和
     float local_sum = 0.0f;
@@ -67,25 +67,31 @@ __global__ void spec_dec_v1_kernel(
         local_sum += fmax(0.0f, diff);
     }
 
+    // 2. 每个 warp 内的线程算 warp 内前缀段和
     int lane_id = tid % 32;
     int warp_id = tid / 32;
     for (int offset = 1; offset < 32; offset <<= 1) {
+        // 获取前第 offset 位线程发射过来的段和
         float n = __shfl_up_sync(0xffffffff, local_sum, offset);
         if (lane_id >= offset)
             local_sum += n;
     }
+    // 3. 每个 warp 最后一个线程持有 warp 内总和
     if (lane_id == 31)
         chunked_sum[warp_id] = local_sum;
     __syncthreads();
 
+    // 4. 算前面 warp 的总和
     float carry = 0.0f;
     for (int i = 0; i < warp_id; i++) {
         carry += chunked_sum[i];
     }
     float inclusive_scan = carry + local_sum;
+    // 5. 拿前一个线程的总和当 exclusive_scan 结果
     float up = __shfl_up_sync(0xffffffff, inclusive_scan, 1);
     float exclusive_scan = lane_id == 0 ? carry : up;
 
+    // 计算完毕，每个线程取总和
     if (tid == THREAD_PER_BLOCK - 1) {
         sum = inclusive_scan;
     }
@@ -123,8 +129,8 @@ __global__ void spec_dec_v1_kernel(
                 }
             }
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     // 把数据搬进 output_tokens
     if (tid < T + 1) {
@@ -147,9 +153,7 @@ extern "C" void solve_v1(
     int T,
     int V
 ) {
-    int size = sizeof(int) + sizeof(bool) * T +
-               sizeof(float) * ((THREAD_PER_BLOCK + 31) / 32);
-    spec_dec_v1_kernel<<<B, THREAD_PER_BLOCK, size>>>(
+    spec_dec_v1_kernel<<<B, THREAD_PER_BLOCK>>>(
         draft_tokens,
         draft_probs,
         target_probs,

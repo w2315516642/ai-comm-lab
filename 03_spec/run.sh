@@ -10,7 +10,7 @@ mkdir -p build
 # 新版本文件加进来后,在这一行追加即可(或写进一个 wildcard)
 nvcc -arch=sm_89 -O3 -o build/bench_spec_dec \
   bench_spec_dec.cu \
-  spec_dec_v0.cu spec_dec_v1.cu spec_dec_ans0.cu spec_dec_ans1.cu
+  spec_dec_v0.cu spec_dec_v1.cu spec_dec_v2.cu spec_dec_ans0.cu spec_dec_ans1.cu
 
 # 尺寸扫描:B  T  V
 ./build/bench_spec_dec 1 8 32768
