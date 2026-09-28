@@ -5,8 +5,13 @@ CompileFlags:
   Add:
     - -x
     - cuda
+    - --cuda-gpu-arch=sm_89
+    - --no-cuda-version-check
     - -I/usr/local/cuda/include
+    - -I/home/yue/projects/ai-comm-lab/third_party/cutlass/include
     - --cuda-path=/usr/local/cuda
+
+---
 
 # C/C++ 文件：只加 CUDA 头文件路径
 If:
@@ -14,4 +19,5 @@ If:
 CompileFlags:
   Add:
     - -I/usr/local/cuda/include
+    - -I/home/yue/projects/ai-comm-lab/third_party/cutlass/include
     - --cuda-path=/usr/local/cuda

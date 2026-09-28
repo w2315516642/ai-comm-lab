@@ -26,6 +26,7 @@ static const Impl kImpls[] = {
     {"v0-baseline", solve_v0},
     {"v1-approved", solve_v1},
     {"v2-vector", solve_v2},
+    {"v3-warp-chunk", solve_v3},
     {"ans0", solve_ans0},
     {"ans1", solve_ans1},
     // {"v1-xxx", solve_v1},
@@ -264,8 +265,8 @@ int main(int argc, char **argv) {
     }
 
     // ---------- 计时对比 ----------
-    printf("impl          correct   avg_ms     tokens/s\n");
-    printf("----------------------------------------------\n");
+    printf("impl          correct   avg_ms       Mtok/s\n");
+    printf("--------------------------------------------\n");
     for (int i = 0; i < n_run; i++) {
         int k = run_idx[i];
         if (k < 0 || k >= kNumImpls) {
@@ -275,13 +276,13 @@ int main(int argc, char **argv) {
         float ms = bench_one(
             kImpls[k].fn, d_draft, d_q, d_p, d_u, d_out, B, T, V, iters, warmup
         );
-        double tok_per_s = (double)B * (T + 1) / (ms / 1000.0);
+        double mtok_per_s = (double)B * (T + 1) / (ms / 1000.0) / 1e6;
         printf(
-            "%-13s %-9s %-12.4f %10.1f\n",
+            "%-13s %-9s %-12.4f %10.2f\n",
             kImpls[k].name,
             correct[k] ? "PASS" : "FAIL",
             ms,
-            tok_per_s
+            mtok_per_s
         );
     }
 

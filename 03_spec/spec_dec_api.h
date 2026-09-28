@@ -52,6 +52,17 @@ void solve_v2(
     int V
 );
 
+void solve_v3(
+    const int *draft_tokens,
+    const float *draft_probs,
+    const float *target_probs,
+    const float *uniform_samples,
+    int *output_tokens,
+    int B,
+    int T,
+    int V
+);
+
 // 新版本在这里补声明,例如:
 // void solve_v1(const int *draft_tokens, ...);
 void solve_ans0(
