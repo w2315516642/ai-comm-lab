@@ -26,6 +26,7 @@ ARCH_FLAGS=(-arch="${CUDA_ARCH}")
 EXTRA_SOURCES=()
 EXTRA_FLAGS=()
 EXTRA_LIBS=()
+CUTLASS_SOURCE=gemm_cutlass.cu
 if [[ "${CUDA_ARCH}" == "sm_90a" ]]; then
   # 只生成 sm_90a 机器码，避免 nvcc 同时生成通用的 compute_90 PTX 回退版本。
   ARCH_FLAGS=(-gencode=arch=compute_90a,code=sm_90a)
@@ -33,15 +34,19 @@ if [[ "${CUDA_ARCH}" == "sm_90a" ]]; then
   EXTRA_FLAGS+=(-DENABLE_GEMM_V9 -DENABLE_GEMM_V10 -DENABLE_GEMM_V11)
   # v10/v11 使用 Driver API 构造 TMA tensor map。
   EXTRA_LIBS+=(-lcuda)
+  CUTLASS_SOURCE=gemm_cutlass_sm90.cu
 fi
 
 echo "Building for ${CUDA_ARCH} (optional sources: ${EXTRA_SOURCES[*]:-none})"
-nvcc "${ARCH_FLAGS[@]}" -O3 "${EXTRA_FLAGS[@]}" \
+echo "CUTLASS backend: ${CUTLASS_SOURCE} (autotune on first call)"
+# 使用发布构建：CUTLASS 的设备端断言调用可能让 WGMMA 流水线被强制串行化。
+# NDEBUG 只关闭 assert，不关闭 bench 的数值正确性检查。
+nvcc "${ARCH_FLAGS[@]}" -std=c++17 -O3 -DNDEBUG "${EXTRA_FLAGS[@]}" \
   --expt-relaxed-constexpr \
   -I../third_party/cutlass/include \
   -o build/bench_gemm \
   bench_gemm.cu gemm_v0.cu gemm_v1.cu gemm_v3.cu gemm_v4.cu gemm_v5.cu \
-  gemm_v6.cu gemm_v7.cu gemm_v8.cu gemm_cutlass.cu "${EXTRA_SOURCES[@]}" "${EXTRA_LIBS[@]}"
+  gemm_v6.cu gemm_v7.cu gemm_v8.cu "${CUTLASS_SOURCE}" "${EXTRA_SOURCES[@]}" "${EXTRA_LIBS[@]}"
 
 run_case() {
   local M="$1"
