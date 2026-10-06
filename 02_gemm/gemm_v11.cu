@@ -323,7 +323,7 @@ struct TensorMapCache {
 
 } // namespace
 
-bool supports_v10(int M, int N, int K) {
+bool supports_v11(int M, int N, int K) {
     // 行跨度需为 16 字节的倍数；M/N/K 不要求整除 BM/BN/BK。
     // TMA 自动对 tile 越界区域补零，输出侧仍做 M/N 边界检查。
     return M > 0 && N > 0 && K > 0 && N % 8 == 0 && K % 8 == 0;
@@ -337,12 +337,12 @@ void solve_v11(
     int N,
     int K
 ) {
-    if (!supports_v10(M, N, K))
+    if (!supports_v11(M, N, K))
         return;
     // cudaMalloc 的地址满足对齐；调用者传入切片指针时也必须满足 16 字节对齐。
     if ((reinterpret_cast<uintptr_t>(A) | reinterpret_cast<uintptr_t>(B)) &
         15) {
-        std::fprintf(stderr, "v10 requires 16-byte-aligned A and B\n");
+        std::fprintf(stderr, "v11 requires 16-byte-aligned A and B\n");
         std::abort();
     }
 

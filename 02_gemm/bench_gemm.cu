@@ -80,10 +80,7 @@ void solve_v11(
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, float *C,
     int M, int N, int K
 );
-// TMA 的全局行跨度要求 16 字节对齐；BF16 的 N/K 需为 8 的倍数。
-static bool supports_v11(int M, int N, int K) {
-    return M > 0 && N > 0 && K > 0 && N % 8 == 0 && K % 8 == 0;
-}
+bool supports_v11(int M, int N, int K);
 #endif
 void solve_cutlass(
     const __nv_bfloat16 *A,
