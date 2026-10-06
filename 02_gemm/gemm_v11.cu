@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -25,6 +26,17 @@ constexpr CUtensorMapSwizzle A_TMA_SWIZZLE =
     BK == 16
         ? CU_TENSOR_MAP_SWIZZLE_32B
         : (BK == 32 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B);
+
+// 每个缓冲区分别保持 TMA swizzle 所需的基地址对齐。
+struct alignas(1024) SharedTile {
+    __nv_bfloat16 a[BM * BK];
+    alignas(1024) __nv_bfloat16 b[BN * BK];
+};
+constexpr int STAGES = 2;
+constexpr int SHARED_BYTES = STAGES * sizeof(SharedTile);
+static_assert(BK == 16 || BK == 32 || BK == 64);
+static_assert(WG_M > 0 && WG_N > 0 && THREADS <= 1024);
+static_assert(BM <= 256 && BN % B_TMA_N == 0);
 
 __host__ __device__ constexpr int swizzle_index(int index, int width_bf16) {
     return index ^ (((index >> 6) & (width_bf16 / 8 - 1)) << 3);
@@ -116,8 +128,8 @@ __device__ __forceinline__ void wait_tma(uint64_t *barrier, uint32_t phase) {
 
 // A 采用 K-major，B 采用 N-major，因此 WGMMA 最后的 trans-b 参数为 1。
 // 同一个 warpgroup 的 128 个线程必须共同执行此函数。
-// 基线版提交后立即等待完成；将 fence、MMA、commit、wait 放在同一个 asm 块中，
-// 让编译器通过输入输出约束识别整个指令序列对累加寄存器的依赖。
+// 提交后等待本次 MMA 完成；下一 tile 的 TMA 已发出，可以与此处计算重叠。
+// 保持 fence、MMA、commit、wait 在同一个 asm 块内，明确累加寄存器依赖。
 __device__ __forceinline__ void wgmma_m64n128k16(
     float (&d)[ACCUM_SIZE], uint64_t desc_a, uint64_t desc_b
 ) {
@@ -199,11 +211,12 @@ __global__ void gemm_bf16_hopper_double_buffer(
 ) {
     const int tid = threadIdx.x;
 
-    __shared__ __align__(1024) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(1024) __nv_bfloat16 Bs[BN * BK];
-    __shared__ __align__(8) uint64_t barrier;
+    extern __shared__ __align__(1024) unsigned char shared_storage[];
+    auto *tiles = reinterpret_cast<SharedTile *>(shared_storage);
+    __shared__ __align__(8) uint64_t barrier[STAGES];
     if (tid == 0) {
-        init_tma_barrier(&barrier);
+        for (int stage = 0; stage < STAGES; ++stage)
+            init_tma_barrier(&barrier[stage]);
     }
     __syncthreads();
 
@@ -214,41 +227,81 @@ __global__ void gemm_bf16_hopper_double_buffer(
     int block_row = blockIdx.y * BM;
     int block_col = blockIdx.x * BN;
     float accum[ACCUM_SIZE] = {};
-    uint32_t phase = 0;
+
+    // 启动流水线：先装入第 0 块，后续每轮预取下一块。
+    if (tid == 0) {
+        load_tiles_tma(
+            tiles[0].a, tiles[0].b, &map_a, &map_b,
+            block_row, block_col, 0, &barrier[0]
+        );
+    }
 
     for (int k_start = 0; k_start < K; k_start += BK) {
-        if (tid == 0) {
+        int tile_id = k_start / BK;
+        int stage = tile_id % STAGES;
+        int next_stage = stage ^ 1;
+        // 两个 barrier 各自每复用一次才翻转 phase：0,0,1,1,0,0,...。
+        uint32_t phase = (tile_id / STAGES) & 1;
+        if (tid == 0 && k_start + BK < K) {
+            // 上轮末尾的 CTA 同步保证 next_stage 已被所有 warpgroup 用完。
             load_tiles_tma(
-                As, Bs, &map_a, &map_b, block_row, block_col, k_start, &barrier
+                tiles[next_stage].a, tiles[next_stage].b, &map_a, &map_b,
+                block_row, block_col, k_start + BK, &barrier[next_stage]
             );
         }
-        wait_tma(&barrier, phase);
-        phase ^= 1;
+        wait_tma(&barrier[stage], phase);
+        const auto &tile = tiles[stage];
 
         for (int k_tile = 0; k_tile < WGMMA_K_TILES; k_tile++) {
             int k = k_tile * WGMMA_K;
             uint64_t desc_a = make_smem_descriptor(
-                As + smem_a_index(wg_row, k), 16, 8 * BK * 2, A_SWIZZLE_MODE
+                tile.a + smem_a_index(wg_row, k), 16, 8 * BK * 2, A_SWIZZLE_MODE
             );
             uint64_t desc_b = make_smem_descriptor(
-                Bs + smem_b_index(wg_col, k),
+                tile.b + smem_b_index(wg_col, k),
                 BK * B_TMA_N * 2,
                 8 * B_TMA_N * 2,
                 1
             );
             wgmma_m64n128k16(accum, desc_a, desc_b);
         }
+        // 各 warpgroup 的 wait_group 已完成，再同步整个 CTA，才能复用该槽位。
         __syncthreads();
     }
     if (tid == 0) {
-        asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(
-                         shared_address(&barrier)
-        )
-                     : "memory");
+        for (int stage = 0; stage < STAGES; ++stage) {
+            asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(
+                             shared_address(&barrier[stage])
+            )
+                         : "memory");
+        }
     }
     store_accumulator(
         C, accum, M, N, block_row + wg_row, block_col + wg_col, wg_thread
     );
+}
+
+void configure_shared_memory() {
+    // BK=32/64 的双缓冲超过默认 48 KiB，需要显式申请动态共享内存上限。
+    if constexpr (SHARED_BYTES + STAGES * sizeof(uint64_t) > 48 * 1024) {
+        static thread_local int configured_device = -1;
+        int device = -1;
+        cudaError_t status = cudaGetDevice(&device);
+        if (status == cudaSuccess && device == configured_device)
+            return;
+        if (status == cudaSuccess) {
+            status = cudaFuncSetAttribute(
+                gemm_bf16_hopper_double_buffer,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                SHARED_BYTES
+            );
+        }
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "v11 shared memory: %s\n", cudaGetErrorString(status));
+            std::abort();
+        }
+        configured_device = device;
+    }
 }
 
 void check_driver(CUresult result, const char *operation) {
@@ -348,8 +401,9 @@ void solve_v11(
 
     static thread_local TensorMapCache maps;
     maps.update(A, B, M, N, K);
+    configure_shared_memory();
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    gemm_bf16_hopper_double_buffer<<<grid, THREADS>>>(
+    gemm_bf16_hopper_double_buffer<<<grid, THREADS, SHARED_BYTES>>>(
         maps.map_a, maps.map_b, C, M, N, K
     );
 }
