@@ -8,7 +8,7 @@
 namespace {
 
 // 阅读顺序：参数 -> PipelineBarriers -> producer_loop / consumer_loop -> kernel。
-// v12 在 v11 双缓冲基础上，把 TMA 生产者和 WGMMA 消费者分到不同 warpgroup。
+// v12 在 v11 双缓冲基础上，用末尾的生产者 warp 给前面的 WGMMA warpgroup 供数。
 
 constexpr int WGMMA_M = 64;
 constexpr int WGMMA_N = 128;
@@ -17,9 +17,10 @@ constexpr int WG_M = 2;
 constexpr int WG_N = 2;
 constexpr int CONSUMER_WARPGROUPS = WG_M * WG_N;
 constexpr int CONSUMER_WARPS = CONSUMER_WARPGROUPS * 4;
-// 第 0 个 warpgroup 是生产者，其余 warpgroup 的输出分工与 v11 相同。
-// 生产者只有线程 0 发 TMA；其余 127 个线程保留，便于保持 warpgroup 边界。
-constexpr int THREADS = (1 + CONSUMER_WARPGROUPS) * 128;
+constexpr int CONSUMER_THREADS = CONSUMER_WARPGROUPS * 128;
+// 消费者从线程 0 起按 128 个线程分组，生产者仅占末尾一个 warp。
+// 该 warp 的首线程 CONSUMER_THREADS 发 TMA，其余 31 个线程等待收尾。
+constexpr int THREADS = CONSUMER_THREADS + 32;
 constexpr int BM = WG_M * WGMMA_M;
 constexpr int BN = WG_N * WGMMA_N;
 constexpr int WGMMA_K_TILES = 1; // [1, 2, 4]
@@ -234,7 +235,7 @@ __device__ __forceinline__ void store_accumulator(
 // 消费者等 full(当前轮)  -> WGMMA 计算并等待完成 -> 到达 empty(当前轮)
 // full 防止读到未加载的数据；empty 防止覆盖仍被其他 warpgroup 使用的数据。
 
-// 只有生产者线程 0 调用。它最多领先消费者 STAGES 个 tile。
+// 只有末尾生产者 warp 的首线程调用。它最多领先消费者 STAGES 个 tile。
 __device__ __forceinline__ void producer_loop(
     SharedTile *tiles, PipelineBarriers &barriers,
     const CUtensorMap *map_a, const CUtensorMap *map_b,
@@ -286,8 +287,8 @@ __device__ __forceinline__ void consumer_loop(
     SharedTile *tiles, PipelineBarriers &barriers,
     float *C, int M, int N, int K, int block_row, int block_col
 ) {
-    // 去掉生产者占用的第一个 warpgroup，剩下的按 WG_M x WG_N 分工。
-    int consumer_id = (threadIdx.x / 128) - 1;
+    // 消费者位于前 CONSUMER_THREADS 个线程，按 WG_M x WG_N 分工。
+    int consumer_id = threadIdx.x / 128;
     int wg_thread = threadIdx.x % 128;
     int wg_row = (consumer_id / WG_N) * WGMMA_M;
     int wg_col = (consumer_id % WG_N) * WGMMA_N;
@@ -328,11 +329,10 @@ __global__ void gemm_bf16_hopper_warpgroup_pipeline(
 
     int block_row = blockIdx.y * BM;
     int block_col = blockIdx.x * BN;
-    if (threadIdx.x < 128) {
-        if (threadIdx.x == 0)
-            producer_loop(tiles, barriers, &map_a, &map_b, block_row, block_col, K);
-    } else {
+    if (threadIdx.x < CONSUMER_THREADS) {
         consumer_loop(tiles, barriers, C, M, N, K, block_row, block_col);
+    } else if (threadIdx.x == CONSUMER_THREADS) {
+        producer_loop(tiles, barriers, &map_a, &map_b, block_row, block_col, K);
     }
 
     // 生产者发完不代表 TMA 已结束；等所有消费者算完再销毁屏障。
