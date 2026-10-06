@@ -82,6 +82,13 @@ void solve_v11(
 );
 bool supports_v11(int M, int N, int K);
 #endif
+#ifdef ENABLE_GEMM_V12
+void solve_v12(
+    const __nv_bfloat16 *A, const __nv_bfloat16 *B, float *C,
+    int M, int N, int K
+);
+bool supports_v12(int M, int N, int K);
+#endif
 void solve_cutlass(
     const __nv_bfloat16 *A,
     const __nv_bfloat16 *B,
@@ -126,6 +133,9 @@ static const Impl kImpls[] = {
 #endif
 #ifdef ENABLE_GEMM_V11
     {"v11-tma-wgmma", nullptr, solve_v11, supports_v11},
+#endif
+#ifdef ENABLE_GEMM_V12
+    {"v12-wg-pipeline", nullptr, solve_v12, supports_v12},
 #endif
     {"cutlass-bf16", nullptr, solve_cutlass, supports_cutlass_bf16},
 };

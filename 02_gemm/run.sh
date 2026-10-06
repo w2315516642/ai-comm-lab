@@ -30,9 +30,9 @@ CUTLASS_SOURCE=gemm_cutlass.cu
 if [[ "${CUDA_ARCH}" == "sm_90a" ]]; then
   # 只生成 sm_90a 机器码，避免 nvcc 同时生成通用的 compute_90 PTX 回退版本。
   ARCH_FLAGS=(-gencode=arch=compute_90a,code=sm_90a)
-  EXTRA_SOURCES+=(gemm_v9.cu gemm_v10.cu gemm_v11.cu)
-  EXTRA_FLAGS+=(-DENABLE_GEMM_V9 -DENABLE_GEMM_V10 -DENABLE_GEMM_V11)
-  # v10/v11 使用 Driver API 构造 TMA tensor map。
+  EXTRA_SOURCES+=(gemm_v9.cu gemm_v10.cu gemm_v11.cu gemm_v12.cu)
+  EXTRA_FLAGS+=(-DENABLE_GEMM_V9 -DENABLE_GEMM_V10 -DENABLE_GEMM_V11 -DENABLE_GEMM_V12)
+  # v10/v11/v12 使用 Driver API 构造 TMA tensor map。
   EXTRA_LIBS+=(-lcuda)
   CUTLASS_SOURCE=gemm_cutlass_sm90.cu
 fi
