@@ -59,6 +59,32 @@ void solve_v8(
     int K
 );
 bool supports_v8(int M, int N, int K);
+#ifdef ENABLE_GEMM_V9
+void solve_v9(
+    const __nv_bfloat16 *A,
+    const __nv_bfloat16 *B,
+    float *C,
+    int M, int N, int K
+);
+bool supports_v9(int M, int N, int K);
+#endif
+#ifdef ENABLE_GEMM_V10
+void solve_v10(
+    const __nv_bfloat16 *A, const __nv_bfloat16 *B, float *C,
+    int M, int N, int K
+);
+bool supports_v10(int M, int N, int K);
+#endif
+#ifdef ENABLE_GEMM_V11
+void solve_v11(
+    const __nv_bfloat16 *A, const __nv_bfloat16 *B, float *C,
+    int M, int N, int K
+);
+// TMA 的全局行跨度要求 16 字节对齐；BF16 的 N/K 需为 8 的倍数。
+static bool supports_v11(int M, int N, int K) {
+    return M > 0 && N > 0 && K > 0 && N % 8 == 0 && K % 8 == 0;
+}
+#endif
 void solve_cutlass(
     const __nv_bfloat16 *A,
     const __nv_bfloat16 *B,
@@ -95,6 +121,15 @@ static const Impl kImpls[] = {
     {"v6-bf16-async", nullptr, solve_v6, supports_v5},
     {"v7-ldmatrix", nullptr, solve_v7, supports_v5},
     {"v8-ldmatrix", nullptr, solve_v8, supports_v8},
+#ifdef ENABLE_GEMM_V9
+    {"v9-wgmma", nullptr, solve_v9, supports_v9},
+#endif
+#ifdef ENABLE_GEMM_V10
+    {"v10-tma-wgmma", nullptr, solve_v10, supports_v10},
+#endif
+#ifdef ENABLE_GEMM_V11
+    {"v11-tma-wgmma", nullptr, solve_v11, supports_v11},
+#endif
     {"cutlass-bf16", nullptr, solve_cutlass, supports_cutlass_bf16},
 };
 static constexpr int kNumImpls = sizeof(kImpls) / sizeof(kImpls[0]);
