@@ -21,3 +21,26 @@ CompileFlags:
     - -I/usr/local/cuda/include
     - -I/home/yue/projects/ai-comm-lab/third_party/cutlass/include
     - --cuda-path=/usr/local/cuda
+
+---
+# Mega attention SM100: match the CUDA and dependency paths used by run.sh.
+If:
+  PathMatch: 05_attention/03_megaAttn/sm100/.*\.(cu|cuh|h)$
+CompileFlags:
+  Remove: [-I, --cuda-path=*, --cuda-gpu-arch=*, -std=*]
+  Add:
+    - -std=c++20
+    - -x
+    - cuda
+    - --cuda-gpu-arch=sm_100a
+    - --cuda-path=/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cuda-12.9
+    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cuda-12.9/include
+    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cuda-12.9/include/cccl
+    - -I/home/yue/projects/ai-comm-lab/third_party/flashmla/csrc
+    - -I/home/yue/projects/ai-comm-lab/third_party/flashmla/csrc/kerutils/include
+    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cutlass/include
+    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cutlass/tools/util/include
+    - -DNDEBUG
+    # clangd also includes cuRAND headers, absent from the local nvcc-only toolkit.
+    - -idirafter
+    - /usr/local/cuda/include
