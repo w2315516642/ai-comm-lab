@@ -38,8 +38,8 @@ CompileFlags:
     - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cuda-12.9/include/cccl
     - -I/home/yue/projects/ai-comm-lab/third_party/flashmla/csrc
     - -I/home/yue/projects/ai-comm-lab/third_party/flashmla/csrc/kerutils/include
-    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cutlass/include
-    - -I/home/yue/projects/ai-comm-lab/05_attention/03_megaAttn/sm100/build/cutlass/tools/util/include
+    - -I/home/yue/projects/ai-comm-lab/third_party/cutlass/include
+    - -I/home/yue/projects/ai-comm-lab/third_party/cutlass/tools/util/include
     - -DNDEBUG
     # clangd also includes cuRAND headers, absent from the local nvcc-only toolkit.
     - -idirafter

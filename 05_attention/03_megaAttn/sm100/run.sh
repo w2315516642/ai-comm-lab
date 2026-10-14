@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 # Environment and dependency checks.
 REPO_ROOT="$(cd ../../.. && pwd)"
 FLASHMLA_DIR="$REPO_ROOT/third_party/flashmla"
-CUTLASS_DIR="${CUTLASS_DIR:-$PWD/build/cutlass}"
+CUTLASS_DIR="${CUTLASS_DIR:-$REPO_ROOT/third_party/cutlass}"
 if [[ -z "${CUDA_HOME:-}" ]]; then
     CUDA_HOME=/usr/local/cuda
     if [[ -x build/cuda-12.9/bin/nvcc ]]; then CUDA_HOME="$PWD/build/cuda-12.9"; fi
@@ -23,9 +23,9 @@ VERSION="$("$NVCC" --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
     || fail 'FlashMLA is missing; initialize third_party/flashmla with git submodule update --init.'
 [[ -f "$CUTLASS_DIR/include/cute/tensor.hpp" ]] || fail "CUTLASS not found: $CUTLASS_DIR."
 [[ "$(git -C "$FLASHMLA_DIR" rev-parse HEAD)" == 0eee43b12f034b657133cf2afca6a72ebb6efccf ]] \
-    || fail 'FlashMLA does not match the fixed v0 version.'
-[[ "$(git -C "$CUTLASS_DIR" rev-parse HEAD)" == 147f5673d0c1c3dcf66f78d677fd647e4a020219 ]] \
-    || fail 'CUTLASS does not match the fixed v0 version.'
+    || fail 'FlashMLA does not match the pinned submodule version.'
+[[ "$(git -C "$CUTLASS_DIR" rev-parse HEAD)" == 7107b05535f8977f5ecb9d01ee203205b1fd9bc4 ]] \
+    || fail 'CUTLASS does not match the pinned submodule version.'
 
 # Build v0 and add v1 automatically when present.
 mkdir -p build

@@ -222,8 +222,8 @@ class Kernel {
                     float cur_sin =
                         __shfl_sync(0xffffffff, cached_sin[1], j / 2);
                     float2 y = apply_rope(x, cur_cos, cur_sin);
-                    *(nv_bfloat162 *)(cached_q + local_tile_idx * TILE_SIZE + j
-                    ) = nv_bfloat162{
+                    *(nv_bfloat162 *)(cached_q + local_tile_idx * TILE_SIZE +
+                                      j) = nv_bfloat162{
                         __float2bfloat16_rn(y.x), __float2bfloat16_rn(y.y)
                     };
                 }
@@ -304,8 +304,8 @@ class Kernel {
 
                 *((uint8_t *)(params.out_sf + cur_job.s_q_idx +
                               wv_group_idx * params.stride_out_sf_wv_group +
-                              (sf_block_idx / 4) * params.stride_out_sf_head_dim
-                  ) +
+                              (sf_block_idx / 4) *
+                                  params.stride_out_sf_head_dim) +
                   sf_block_idx % 4) = output_sf[mma_atom_idx][i];
             }
 
@@ -466,7 +466,8 @@ class Kernel {
                 smem.bar_clc_full, smem.clc_response_obj
             );
 
-            smem.bar_clc_full.arrive_and_expect_tx(sizeof(smem.clc_response_obj)
+            smem.bar_clc_full.arrive_and_expect_tx(
+                sizeof(smem.clc_response_obj)
             );
 
             smem.bar_clc_full.wait(phase & 1);
@@ -649,7 +650,8 @@ class Kernel {
     __device__ __forceinline__ void dequantize_token(
         uint32_t token_idx,
         uint8_t *slot_base,
-        const uint32_t (&cached_input
+        const uint32_t (
+            &cached_input
         )[NUM_TOKENS_PER_THREAD][MAX_CHUNKS_PER_LANE][4],
         const uint32_t (&cached_scales)[NUM_TOKENS_PER_THREAD][2]
     ) {
@@ -687,8 +689,9 @@ class Kernel {
                     );
                 }
             } else {
-                __nv_fp8_e8m0 scale = ((__nv_fp8_e8m0 *)cached_scales[token_idx]
-                )[g * F::CHUNK_ELEMS / F::QUANT_TILE_SIZE];
+                __nv_fp8_e8m0 scale =
+                    ((__nv_fp8_e8m0 *)cached_scales[token_idx])
+                        [g * F::CHUNK_ELEMS / F::QUANT_TILE_SIZE];
 
                 // 数组元素是 BF16 二元组，元素数为标量数的一半。
 #pragma unroll
@@ -752,8 +755,7 @@ class Kernel {
         uint8_t *slot_base = (uint8_t *)smem.kv_slots[kv_slot_idx];
 
         cute::for_each(
-            cute::make_int_sequence<NUM_ROWS_PER_WARP / 4>{},
-            [&](auto i) {
+            cute::make_int_sequence<NUM_ROWS_PER_WARP / 4>{}, [&](auto i) {
                 uint32_t row_start = local_warp_idx * NUM_ROWS_PER_WARP + i * 4;
                 constexpr bool is_fp4 =
                     i / (NUM_ROWS_PER_WAVEFRONT / 4) >= NUM_FP8_TOKENS;
@@ -779,8 +781,8 @@ class Kernel {
         for_each_token<NUM_FP8_TOKENS>([&]<typename F>(uint32_t token_idx) {
             if constexpr (F::IS_FP4) {
                 uint64_t scale_addr =
-                    ((uint64_t)scale_ptrs[token_idx] + get_chunk_base<F>(0) * 2
-                    );
+                    ((uint64_t)scale_ptrs[token_idx] +
+                     get_chunk_base<F>(0) * 2);
 
                 uint64_t scales = 0;
                 if (scale_ptrs[token_idx] != nullptr) {
@@ -834,8 +836,9 @@ class Kernel {
             callable.template operator()<KVLocation::ORIG>(kv_block_idx);
         }
         if (has_mixed_block) {
-            callable.template operator(
-            )<KVLocation::ORIG_AND_EXTRA>(num_full_orig_blocks);
+            callable.template operator()<KVLocation::ORIG_AND_EXTRA>(
+                num_full_orig_blocks
+            );
         }
 
 #pragma unroll 1
