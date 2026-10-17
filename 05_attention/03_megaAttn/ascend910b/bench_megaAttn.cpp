@@ -109,6 +109,70 @@ template<class F> void ExpectFailure(F fn, const char *name) {
     check(threw, name);
 }
 
+
+// 独立参考：收集全部 KV 后一次性 softmax，不使用设备侧的 online 递推公式。
+struct OnlineExpected {
+    std::vector<float> output = std::vector<float>(Q_ELEMS, 0);
+    std::vector<float> row_max = std::vector<float>(HEAD_TILE, -INFINITY);
+    std::vector<float> row_sum = std::vector<float>(HEAD_TILE, 0);
+};
+OnlineExpected ReferenceOnline(const mega_test::Case &c, Stage1Config p) {
+    std::vector<Expected> tiles;
+    for (p.kv_begin = 0; p.kv_begin < p.topk + p.extra_topk; p.kv_begin += KV_TILE)
+        tiles.push_back(ReferenceTile(c, p));
+    OnlineExpected r;
+    for (int h = 0; h < HEAD_TILE; ++h) {
+        double m = -INFINITY, l = 0;
+        std::vector<double> acc(DIM, 0);
+        for (const auto &tile : tiles)
+            for (int t = 0; t < KV_TILE; ++t)
+                if (tile.valid[t]) m = std::max(m, double(tile.masked[h*KV_TILE+t]));
+        if (m == -INFINITY) continue;
+        for (const auto &tile : tiles) {
+            for (int t = 0; t < KV_TILE; ++t) {
+                if (!tile.valid[t]) continue;
+                double weight = std::exp(double(tile.masked[h*KV_TILE+t])-m);
+                l += weight;
+                for (int d = 0; d < DIM; ++d)
+                    acc[d] += weight * mega_test::from_bf16(tile.kv[t*DIM+d]);
+            }
+        }
+        r.row_max[h] = float(m);
+        r.row_sum[h] = float(l);
+        for (int d = 0; d < DIM; ++d) r.output[h*DIM+d] = float(acc[d]/l);
+    }
+    return r;
+}
+
+void OnlineOracleTests() {
+    mega_test::Case c(3,72,121,5);
+    auto empty = ReferenceOnline(c,MakeConfig(c,0,0,0));
+    for (float x : empty.output) check(x == 0, "Empty attention must be zero");
+    for (float x : empty.row_max) check(x == -INFINITY, "Empty max");
+    for (float x : empty.row_sum) check(x == 0, "Empty sum");
+    // Q=0 使所有有效分数相同：输出必须等于 V 的平均，分母就是有效个数。
+    std::fill(c.q.begin(),c.q.end(),mega_test::bf16(0));
+    c.main.pack(std::vector<float>(c.main.decoded.size(),1));
+    c.extra.pack(std::vector<float>(c.extra.decoded.size(),6));
+    auto uniform = ReferenceOnline(c,MakeConfig(c,2,0,0));
+    float mean = float(c.k+6*c.ek)/(c.k+c.ek);
+    for (float x : uniform.output) check(std::abs(x-mean)<1e-6f, "Uniform attention");
+    for (float x : uniform.row_max) check(x==0, "Uniform max");
+    for (float x : uniform.row_sum) check(x==c.k+c.ek, "Uniform sum");
+    // 后续块的最大值更大，另用两组常量的闭式权重核对参考结果。
+    std::fill(c.q.begin(),c.q.end(),mega_test::bf16(.125f));
+    std::fill(c.positions.begin(),c.positions.end(),0);
+    c.main.pack(std::vector<float>(c.main.decoded.size(),.5f));
+    c.extra.pack(std::vector<float>(c.extra.decoded.size(),.75f));
+    auto rising = ReferenceOnline(c,MakeConfig(c,2,0,0));
+    double a = std::exp(-16.0*SCORE_SCALE);
+    double sum = c.k*a+c.ek;
+    double out = (.5*c.k*a+.75*c.ek)/sum;
+    for (float x : rising.output) check(std::abs(x-out)<1e-6, "Rising max output");
+    for (float x : rising.row_sum) check(std::abs(x-sum)<2e-5, "Rising max sum");
+    std::puts("PASS CPU: stage-2 full softmax oracle, empty/uniform/rising-max");
+}
+
 void OracleTests() {
     mega_test::cpu_tests();
     mega_test::Case c(3, 72, 121, 5);
@@ -207,17 +271,18 @@ template<class T> struct DeviceBuffer {
 };
 
 // 在 Host 生成固定 QK 的 tiling；GM 输入输出让阶段 1 的观测点可直接复用。
-std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform) {
+std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, int ubBytes = 64*1024) {
     using namespace matmul_tiling;
     MatmulApiTiling api(platform);
     api.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, false);
-    api.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, true);
+    api.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, !pv);
     api.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
     api.SetBias(false);
-    api.SetShape(HEAD_TILE, KV_TILE, DIM);
-    api.SetOrgShape(HEAD_TILE, KV_TILE, DIM);
+    int n = pv ? DIM : KV_TILE, k = pv ? KV_TILE : DIM;
+    api.SetShape(HEAD_TILE, n, k);
+    api.SetOrgShape(HEAD_TILE, n, k);
     // 剩余 UB 留给约 118 KiB 的用户缓冲；不要默认把全部 UB 交给 Matmul。
-    api.SetBufferSpace(-1, -1, 64*1024);
+    api.SetBufferSpace(-1, -1, ubBytes);
     optiling::TCubeTiling tiling;
     check(api.GetTiling(tiling) != -1, "QK tiling failed");
     std::vector<uint8_t> bytes(tiling.GetDataSize());
@@ -265,6 +330,48 @@ void RunCase(Runtime &rt, const char *name, const mega_test::Case &c,
     std::printf("PASS NPU stage1: %s\n",name);
 }
 
+
+void RunOnlineCase(Runtime &rt, const char *name, const mega_test::Case &c,
+                   const Stage1Config &p, void *qkTiling, void *pvTiling, void *workspace) {
+    auto ref = ReferenceOnline(c,p);
+    DeviceBuffer<uint16_t> q(c.q), qLoaded(Q_ELEMS), qRope(Q_ELEMS), kv(KV_ELEMS), prob(SCORE_ELEMS);
+    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes);
+    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(KV_TILE);
+    DeviceBuffer<float> rope(c.cos_sin), scores(SCORE_ELEMS), pv(Q_ELEMS), output(Q_ELEMS);
+    DeviceBuffer<float> rowMax(HEAD_TILE), rowSum(HEAD_TILE);
+    DeviceBuffer<int32_t> status(std::vector<int32_t>(8,-1));
+    DeviceBuffer<Stage1Config> config(std::vector<Stage1Config>{p});
+    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
+    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
+    Stage2Output out{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
+    std::fprintf(stderr,"NPU stage2 [%s]: launch + wait (30 s timeout)\n",name);
+    launch_mega_attn_stage2(in,scratch,out,config.data,qkTiling,pvTiling,workspace,rt.stream);
+    auto sync = aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
+    if (sync != ACL_SUCCESS) std::fprintf(stderr,"NPU stage2 synchronize failed: %d\n",int(sync));
+    AclCheck(sync,"stage2 synchronize");
+    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
+    rope.CheckGuard(); config.CheckGuard(); qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard();
+    valid.CheckGuard(); scores.CheckGuard(); status.CheckGuard(); prob.CheckGuard(); pv.CheckGuard();
+    output.CheckGuard(); rowMax.CheckGuard(); rowSum.CheckGuard();
+    int step = status.Download()[0];
+    check(step==0 || (step>=1 && step<=6) || (step>=10 && step<=14), "Stage2 completion status");
+    if (step==int(Step::OnlineSoftmax)) {
+        // 此时第一块的 softmax 尚未实现，导出的状态应仍为初始化值。
+        CompareFloats(rowMax.Download(),std::vector<float>(HEAD_TILE,-INFINITY),0,0,"Initial max");
+        CompareFloats(rowSum.Download(),std::vector<float>(HEAD_TILE,0),0,0,"Initial sum");
+        CompareFloats(output.Download(),std::vector<float>(Q_ELEMS,0),0,0,"Initial accumulator");
+        std::puts("PASS NPU: InitOnlineState");
+    }
+    if (step!=0) throw std::runtime_error(std::string("TODO stage2: ")+StepName(step));
+    // P 舍入为 BF16 后进入 Cube；参考用 FP64 softmax，容纳该舍入与 RoPE 误差。
+    CompareFloats(output.Download(),ref.output,.002f,.02f,"Online attention");
+    CompareFloats(rowMax.Download(),ref.row_max,.002f,.01f,"Online max");
+    CompareFloats(rowSum.Download(),ref.row_sum,.03f,.01f,"Online sum");
+    if (p.length==0 && p.extra_length==0)
+        CompareFloats(output.Download(),ref.output,0,0,"Empty attention");
+    std::printf("PASS NPU stage2: %s\n",name);
+}
+
 void NpuTests() {
     Runtime rt;
     std::fprintf(stderr, "NPU: query platform\n");
@@ -285,6 +392,32 @@ void NpuTests() {
     RunCase(rt,"short extra length",c,MakeConfig(c,1,16,64),tiling.data,workspace.data);
     mega_test::Case small(1,8,9,5);
     RunCase(rt,"small page + mixed tail",small,MakeConfig(small,0,0,0),tiling.data,workspace.data);
+    std::puts("PASS: stage 1 regression (8 cases)");
+    // 用户 UB 约 153 KiB；QK/PV 各限 16 KiB，合计不超过 910B 的 192 KiB。
+    DeviceBuffer<uint8_t> qkTiling(MakeCubeTiling(*platform,false,16*1024));
+    DeviceBuffer<uint8_t> pvTiling(MakeCubeTiling(*platform,true,16*1024));
+    auto run = [&](const char *name, const mega_test::Case &input, int query, int head) {
+        RunOnlineCase(rt,name,input,MakeConfig(input,query,head,0),
+                      qkTiling.data,pvTiling.data,workspace.data);
+    };
+    run("mixed + tail",c,2,0);
+    run("short lengths",c,1,16);
+    run("all empty",c,0,32);
+    c.lengths[2]=0;
+    run("empty prefix then FP4",c,2,48);
+    c.lengths[2]=13; c.extra_lengths[2]=0;
+    run("empty suffix after FP8",c,2,0);
+    c.lengths[2]=1;
+    run("single valid KV",c,2,16);
+    run("single tile + small pages",small,0,0);
+    mega_test::Case rising(1,128,65,5);
+    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(.125f));
+    rising.main.pack(std::vector<float>(rising.main.decoded.size(),.5f));
+    rising.extra.pack(std::vector<float>(rising.extra.decoded.size(),.75f));
+    run("maximum rises in later tile",rising,0,0);
+    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
+    run("large positive scores",rising,0,0);
+    qkTiling.CheckGuard(); pvTiling.CheckGuard();
     tiling.CheckGuard(); workspace.CheckGuard();
 }
 } // namespace
@@ -293,11 +426,12 @@ void NpuTests() {
 int main() {
     try {
         OracleTests();
+        OnlineOracleTests();
 #ifdef MEGA_ASCEND_CPU_ONLY
         std::puts("CPU oracle only: NPU compilation/execution NOT tested; learner TODOs remain.");
 #else
         NpuTests();
-        std::puts("PASS: stage 1 single-tile QK (not full attention yet)");
+        std::puts("PASS: stage 2 online attention (sink/inverse RoPE/quantization remain)");
 #endif
         return 0;
     } catch (const std::exception &e) {

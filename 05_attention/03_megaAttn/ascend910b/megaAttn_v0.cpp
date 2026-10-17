@@ -77,7 +77,7 @@ class KernelMegaStage1 {
         Report(Step::Done);
     }
 
-  private:
+  protected:
     __aicore__ inline bool LoadQuery() {
         // TODO 1：把 Q 的 head_begin..head_begin+15 重排进 qBuf，并导出
         // qLoadedGm。 原始索引：query*64*512 + (d/16)*64*16 + head*16 + d%16。
@@ -350,7 +350,8 @@ class KernelMegaStage1 {
 
         float value;
         if (exponent == 0) {
-            // AI Core 不支持 uint32_t 直接转 float；尾数仅 0~7，可先转 int32_t。
+            // AI Core 不支持 uint32_t 直接转 float；尾数仅 0~7，可先转
+            // int32_t。
             value = float(int32_t(mantissa)) / 512.0f;
         } else {
             // 转成 fp32，指数偏置由 7 变为 127，尾数由 3 位扩到 23 位
@@ -396,6 +397,13 @@ class KernelMegaStage1 {
         DataCopy(statusGm, local, 8);
     }
 
+    template <HardEvent eventType> __aicore__ inline void SyncPipeline() {
+        auto event =
+            static_cast<event_t>(GetTPipePtr()->FetchEventID(eventType));
+        SetFlag<eventType>(event);
+        WaitFlag<eventType>(event);
+    }
+
     Stage1Config cfg;
     GlobalTensor<bfloat16_t> qGm, qLoadedGm, qRopeGm, kvGm;
     GlobalTensor<uint8_t> kv8Gm, kv4Gm;
@@ -418,9 +426,9 @@ extern "C" __global__ __aicore__ void mega_attn_stage1(
     auto dst = reinterpret_cast<uint32_t *>(&tiling);
     for (int i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); ++i)
         dst[i] = src[i];
-    // Host 已分配系统 workspace，直接传给 Matmul，不再调用弃用的设置接口。
-    // 注册宏让 AIC 处理 Matmul 消息；其余核心算法从 AIV 侧驱动。
-    REGIST_MATMUL_OBJ(&pipe, workspace, op.mm, &tiling);
+    // HAVE_WORKSPACE 已初始化系统通信区；入参 workspace 已偏移到用户区。
+    // Matmul 必须取系统区地址，AIC 在注册宏内服务，后续逻辑由 AIV 执行。
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), op.mm, &tiling);
     op.Init(
         q, kv8, kv4, ids, extra_ids, rope, config, q_loaded, q_rope, kv, valid,
         scores, status, &pipe
@@ -438,5 +446,298 @@ extern "C" void launch_mega_attn_stage1(
         (GM_ADDR)config, (GM_ADDR)out.q_loaded, (GM_ADDR)out.q_rope,
         (GM_ADDR)out.kv, (GM_ADDR)out.valid, (GM_ADDR)out.scores,
         (GM_ADDR)out.status, (GM_ADDR)cube_tiling, (GM_ADDR)workspace
+    );
+}
+
+// 阶段 2 复用阶段 1 的搬运/QK，只增加跨 KV tile 的 softmax 与 PV 累加。
+class KernelMegaStage2 : public KernelMegaStage1 {
+  public:
+    using VType = MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t>;
+    Matmul<QType, VType, ScoreType> pvMm;
+
+    __aicore__ inline void InitOnline(
+        GM_ADDR p, GM_ADDR pv, GM_ADDR output, GM_ADDR row_max, GM_ADDR row_sum,
+        TPipe *pipe
+    ) {
+        pGm.SetGlobalBuffer((__gm__ bfloat16_t *)p, SCORE_ELEMS);
+        pvGm.SetGlobalBuffer((__gm__ float *)pv, Q_ELEMS);
+        outputGm.SetGlobalBuffer((__gm__ float *)output, Q_ELEMS);
+        maxGm.SetGlobalBuffer((__gm__ float *)row_max, HEAD_TILE);
+        sumGm.SetGlobalBuffer((__gm__ float *)row_sum, HEAD_TILE);
+
+        pipe->InitBuffer(pBuf, SCORE_ELEMS * sizeof(bfloat16_t));
+        pipe->InitBuffer(accBuf, Q_ELEMS * sizeof(float));
+        pipe->InitBuffer(maxBuf, HEAD_TILE * sizeof(float));
+        pipe->InitBuffer(sumBuf, HEAD_TILE * sizeof(float));
+        pipe->InitBuffer(alphaBuf, HEAD_TILE * sizeof(float));
+    }
+
+    __aicore__ inline void ProcessOnline() {
+        if (!LoadQuery()) {
+            Report(Step::LoadQuery);
+            return;
+        }
+        if (!ApplyQueryRope()) {
+            Report(Step::ApplyQueryRope);
+            return;
+        }
+        if (!InitOnlineState()) {
+            Report(Step::InitOnlineState);
+            return;
+        }
+        for (cfg.kv_begin = 0; cfg.kv_begin < cfg.topk + cfg.extra_topk;
+             cfg.kv_begin += KV_TILE) {
+            if (!LoadKvTile()) {
+                Report(Step::LoadKvTile);
+                return;
+            }
+            if (!DecodeKvTile()) {
+                Report(Step::DecodeKvTile);
+                return;
+            }
+            if (!ComputeQk()) {
+                Report(Step::ComputeQk);
+                return;
+            }
+            if (!MaskScores()) {
+                Report(Step::MaskScores);
+                return;
+            }
+            if (!OnlineSoftmax()) {
+                ExportOnlineState();
+                Report(Step::OnlineSoftmax);
+                return;
+            }
+            if (!ComputePv()) {
+                Report(Step::ComputePv);
+                return;
+            }
+            if (!AccumulateOutput()) {
+                Report(Step::AccumulateOutput);
+                return;
+            }
+        }
+        if (!NormalizeOutput()) {
+            Report(Step::NormalizeOutput);
+            return;
+        }
+        ExportOnlineState();
+        Report(Step::Done);
+    }
+
+  private:
+    __aicore__ inline bool InitOnlineState() {
+        // TODO 7：每个 head 的 m=-inf、l=0、alpha=1；accBuf 的 [16,512] 全部置
+        // 0。
+        auto maxLocal = maxBuf.Get<float>();
+        auto sumLocal = sumBuf.Get<float>();
+        auto alphaLocal = alphaBuf.Get<float>();
+        auto accLocal = accBuf.Get<float>();
+
+        float negInf =
+            AscendC::GetScalarBitcodeValue<uint32_t, float>(0xff800000u);
+
+        Duplicate(maxLocal, negInf, HEAD_TILE);
+        Duplicate(sumLocal, 0.0f, HEAD_TILE);
+        Duplicate(alphaLocal, 1.0f, HEAD_TILE);
+        Duplicate(accLocal, 0.0f, Q_ELEMS);
+
+        // Duplicate 走的 Vector 通道
+        SyncPipeline<HardEvent::V_S>();
+
+        return true;
+    }
+
+    __aicore__ inline bool OnlineSoftmax() {
+        // TODO 8：m'=max(m,max(score))，alpha=exp(m-m')，P=exp(score-m')。
+        // l'=alpha*l+sum(P)；分母用 FP32 的 P，送 Cube 的 P 舍入为 BF16。
+        // 全空前缀保持 m=-inf、l=0、P=0、alpha=1，避免 -inf-(-inf)。
+        // 输入在 scoreBuf；更新 maxBuf/sumBuf/alphaBuf，把 pBuf 导出到 pGm。
+        auto scoreLocal = scoreBuf.Get<float>();
+        auto pLocal = pBuf.Get<bfloat16_t>();
+        auto maxLocal = maxBuf.Get<float>();
+        auto sumLocal = sumBuf.Get<float>();
+        auto alphaLocal = alphaBuf.Get<float>();
+
+        float negInf =
+            AscendC::GetScalarBitcodeValue<uint32_t, float>(0xff800000u);
+
+        for (int32_t h = 0; h < HEAD_TILE; ++h) {
+            int32_t headBase = h * KV_TILE;
+            float oldMax = maxLocal.GetValue(h);
+            float newMax = oldMax;
+
+            for (int32_t t = 0; t < KV_TILE; ++t) {
+                float score = scoreLocal.GetValue(headBase + t);
+                if (score > newMax) {
+                    newMax = score;
+                }
+            }
+
+            // 避免 -inf - (-inf)
+            bool empty = newMax == negInf;
+            alphaLocal.SetValue(h, empty ? 0.0f : oldMax - newMax);
+
+            // 减最大值
+            for (int32_t t = 0; t < KV_TILE; ++t) {
+                float shifted =
+                    empty ? negInf : scoreLocal.GetValue(headBase + t) - newMax;
+                scoreLocal.SetValue(headBase + t, shifted);
+            }
+            maxLocal.SetValue(h, newMax);
+        }
+
+        SyncPipeline<HardEvent::S_V>();
+        Exp(scoreLocal, scoreLocal, SCORE_ELEMS);
+        Exp(alphaLocal, alphaLocal, HEAD_TILE);
+        SyncPipeline<HardEvent::V_S>();
+
+        // 更新 sum
+        for (int32_t h = 0; h < HEAD_TILE; ++h) {
+            int32_t headBase = h * KV_TILE;
+            float tileSum = 0.0f;
+
+            for (int32_t t = 0; t < KV_TILE; ++t) {
+                float p = scoreLocal.GetValue(headBase + t);
+                tileSum += p;
+                pLocal.SetValue(headBase + t, AscendC::Cast(p));
+            }
+
+            float oldSum = sumLocal.GetValue(h);
+            float alpha = alphaLocal.GetValue(h);
+            sumLocal.SetValue(h, alpha * oldSum + tileSum);
+        }
+
+        SyncPipeline<HardEvent::S_MTE3>();
+        DataCopy(pGm, pLocal, SCORE_ELEMS);
+        PipeBarrier<PIPE_ALL>();
+        return true;
+    }
+
+    __aicore__ inline bool ComputePv() {
+        // TODO 9：pvMm 计算 [16,64] * [64,512] -> pvGm[16,512]，V 不转置。
+        // 当前 MLA 中 K 和 V 共用 kvGm；发送请求前等 pGm 搬出完成。
+        SyncPipeline<HardEvent::MTE3_S>();
+
+        pvMm.SetTensorA(pGm);
+        pvMm.SetTensorB(kvGm, false);
+
+        pvMm.IterateAll<true>(pvGm);
+        pvMm.End();
+
+        return true;
+    }
+
+    __aicore__ inline bool AccumulateOutput() {
+        // TODO 10：acc[h,d] = alpha[h]*acc[h,d] + pv[h,d]，全部 FP32。
+        // rawBuf 在本轮解码后已不用，可 Get<float>() 暂存完整 PV（32768 B）。
+        auto pvLocal = rawBuf.Get<float>();
+        auto accLocal = accBuf.Get<float>();
+        auto alphaLocal = alphaBuf.Get<float>();
+
+        DataCopy(pvLocal, pvGm, Q_ELEMS);
+        SyncPipeline<HardEvent::MTE2_S>();
+
+        for (int32_t h = 0; h < HEAD_TILE; ++h) {
+            int32_t headBase = h * DIM;
+            float alpha = alphaLocal.GetValue(h);
+
+            for (int32_t d = 0; d < DIM; ++d) {
+                int32_t offset = headBase + d;
+                float oldAcc = accLocal.GetValue(offset);
+                float tilePV = pvLocal.GetValue(offset);
+
+                accLocal.SetValue(offset, alpha * oldAcc + tilePV);
+            }
+        }
+
+        SyncPipeline<HardEvent::S_MTE2>();
+        return true;
+    }
+
+    __aicore__ inline bool NormalizeOutput() {
+        // TODO 11：acc[h,d] /= sum[h]；sum[h]==0 的 head 输出 0。
+        // 本阶段输出 FP32 attention；sink、逆 RoPE、输出量化留到阶段 3。
+        auto accLocal = accBuf.Get<float>();
+        auto sumLocal = sumBuf.Get<float>();
+
+        for (int32_t h = 0; h < HEAD_TILE; ++h) {
+            int32_t headBase = h * DIM;
+            float sum = sumLocal.GetValue(h);
+            bool empty = sum == 0.0f;
+
+            float invSum = empty ? 0.0f : 1.0f / sum;
+
+            for (int32_t d = 0; d < DIM; ++d) {
+                int32_t offset = headBase + d;
+                float value = empty ? 0.0f : accLocal.GetValue(offset) * invSum;
+
+                accLocal.SetValue(offset, value);
+            }
+        }
+
+        return true;
+    }
+
+    __aicore__ inline void ExportOnlineState() {
+        auto event = static_cast<event_t>(
+            GetTPipePtr()->FetchEventID(HardEvent::S_MTE3)
+        );
+        SetFlag<HardEvent::S_MTE3>(event);
+        WaitFlag<HardEvent::S_MTE3>(event);
+        DataCopy(outputGm, accBuf.Get<float>(), Q_ELEMS);
+        DataCopy(maxGm, maxBuf.Get<float>(), HEAD_TILE);
+        DataCopy(sumGm, sumBuf.Get<float>(), HEAD_TILE);
+        PipeBarrier<PIPE_ALL>();
+    }
+
+    GlobalTensor<bfloat16_t> pGm;
+    GlobalTensor<float> pvGm, outputGm, maxGm, sumGm;
+    TBuf<TPosition::VECCALC> pBuf, accBuf, maxBuf, sumBuf, alphaBuf;
+};
+
+extern "C" __global__ __aicore__ void mega_attn_stage2(
+    GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
+    GM_ADDR rope, GM_ADDR config, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
+    GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR p, GM_ADDR pv,
+    GM_ADDR output, GM_ADDR row_max, GM_ADDR row_sum, GM_ADDR qk_tiling,
+    GM_ADDR pv_tiling, GM_ADDR workspace
+) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+    TPipe pipe;
+    KernelMegaStage2 op;
+    TCubeTiling qkTiling, pvTiling;
+    auto qkSrc = reinterpret_cast<__gm__ uint32_t *>(qk_tiling);
+    auto pvSrc = reinterpret_cast<__gm__ uint32_t *>(pv_tiling);
+    auto qkDst = reinterpret_cast<uint32_t *>(&qkTiling);
+    auto pvDst = reinterpret_cast<uint32_t *>(&pvTiling);
+    for (int i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); ++i) {
+        qkDst[i] = qkSrc[i];
+        pvDst[i] = pvSrc[i];
+    }
+    REGIST_MATMUL_OBJ(
+        &pipe, GetSysWorkSpacePtr(), op.mm, &qkTiling, op.pvMm, &pvTiling
+    );
+    op.Init(
+        q, kv8, kv4, ids, extra_ids, rope, config, q_loaded, q_rope, kv, valid,
+        scores, status, &pipe
+    );
+    op.InitOnline(p, pv, output, row_max, row_sum, &pipe);
+    op.ProcessOnline();
+}
+
+extern "C" void launch_mega_attn_stage2(
+    const Stage1Input &in, const Stage1Output &scratch, const Stage2Output &out,
+    void *config, void *qk_tiling, void *pv_tiling, void *workspace,
+    void *stream
+) {
+    mega_attn_stage2<<<1, nullptr, stream>>>(
+        (GM_ADDR)in.q, (GM_ADDR)in.kv_fp8, (GM_ADDR)in.kv_fp4,
+        (GM_ADDR)in.indices, (GM_ADDR)in.extra_indices, (GM_ADDR)in.cos_sin,
+        (GM_ADDR)config, (GM_ADDR)scratch.q_loaded, (GM_ADDR)scratch.q_rope,
+        (GM_ADDR)scratch.kv, (GM_ADDR)scratch.valid, (GM_ADDR)scratch.scores,
+        (GM_ADDR)scratch.status, (GM_ADDR)out.p, (GM_ADDR)out.pv,
+        (GM_ADDR)out.output, (GM_ADDR)out.row_max, (GM_ADDR)out.row_sum,
+        (GM_ADDR)qk_tiling, (GM_ADDR)pv_tiling, (GM_ADDR)workspace
     );
 }

@@ -19,6 +19,14 @@ struct Stage1Output {
     float *scores;     // [16,64]，最终包含 1/sqrt(512) 缩放与 -inf mask
     int32_t *status;    // 分配至少 8 个 int32，即一个 32 B 搬运块
 };
+// 阶段 2：P/PV 是复用的单块暂存，output 是所有 KV 的 attention 结果。
+struct Stage2Output {
+    uint16_t *p;       // [16,64]，未归一化的 exp(score-m)，BF16
+    float *pv;         // [16,512]，当前块的 P*V，FP32
+    float *output;     // [16,512]，最终归一化结果；不含 sink、逆 RoPE、量化
+    float *row_max;    // [16]，最终 m；全空时 -inf
+    float *row_sum;    // [16]，最终 l=sum(exp(score-m))；全空时 0
+};
 } // namespace mega_ascend
 
 // config、cube_tiling、workspace 都是设备地址；stream 是 aclrtStream。
@@ -26,3 +34,10 @@ extern "C" void launch_mega_attn_stage1(
     const mega_ascend::Stage1Input &in,
     const mega_ascend::Stage1Output &out,
     void *config, void *cube_tiling, void *workspace, void *stream);
+
+// cfg.kv_begin 在阶段 2 忽略，从第 0 块遍历全部 KV；scratch 复用阶段 1 的缓冲。
+extern "C" void launch_mega_attn_stage2(
+    const mega_ascend::Stage1Input &in,
+    const mega_ascend::Stage1Output &scratch,
+    const mega_ascend::Stage2Output &out,
+    void *config, void *qk_tiling, void *pv_tiling, void *workspace, void *stream);

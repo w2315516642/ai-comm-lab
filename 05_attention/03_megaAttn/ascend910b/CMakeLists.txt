@@ -36,6 +36,8 @@ if(NOT ASCENDC_CMAKE_DIR)
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 ascendc_library(mega_attn_kernel STATIC megaAttn_v0.cpp)
+# 让启动封装初始化 Matmul 通信区并通知 AIV；workspace 必须是核函数最后一个参数。
+ascendc_compile_definitions(mega_attn_kernel PRIVATE HAVE_WORKSPACE)
 target_include_directories(bench_megaAttn PRIVATE
     "${ASCEND_CANN_PACKAGE_PATH}/include"
     "${ASCEND_CANN_PACKAGE_PATH}/include/experiment")
