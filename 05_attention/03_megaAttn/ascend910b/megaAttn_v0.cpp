@@ -350,7 +350,8 @@ class KernelMegaStage1 {
 
         float value;
         if (exponent == 0) {
-            value = float(mantissa) / 512.0f;
+            // AI Core 不支持 uint32_t 直接转 float；尾数仅 0~7，可先转 int32_t。
+            value = float(int32_t(mantissa)) / 512.0f;
         } else {
             // 转成 fp32，指数偏置由 7 变为 127，尾数由 3 位扩到 23 位
             uint32_t bits = ((exponent + 120) << 23) | (mantissa << 20);
