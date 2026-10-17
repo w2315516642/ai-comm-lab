@@ -479,6 +479,7 @@ inline void cpu_tests() {
 }
 } // namespace mega_test
 
+#ifndef MEGA_ATTN_REFERENCE_ONLY
 // Test runner and GPU benchmark.
 #include <cstdio>
 #include <cstdlib>
@@ -762,12 +763,8 @@ void run_correctness() {
 
 void benchmark(int n, int iterations) {
     mega_test::Case c(n, 128, 512, 128);
-    auto ref = mega_test::reference(c);
     DeviceCase d(c);
     for (const auto &impl : implementations) {
-        d.poison_outputs();
-        impl.solve(d.p, d.stream);
-        d.verify(ref);
         for (int i = 0; i < 3; ++i)
             impl.solve(d.p, d.stream);
         CUDA_CHECK(cudaStreamSynchronize(d.stream));
@@ -830,10 +827,13 @@ int main(int argc, char **argv) {
             return 2;
         }
         std::printf("GPU: %s\n", prop.name);
-        mega_test::cpu_tests();
-        run_correctness();
-        if (!check_only)
+        // 默认只测性能；正确性用例通过 --check-only 单独运行。
+        if (check_only) {
+            mega_test::cpu_tests();
+            run_correctness();
+        } else {
             benchmark(n, iters);
+        }
         return 0;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
@@ -841,3 +841,5 @@ int main(int argc, char **argv) {
     }
 }
 #endif
+
+#endif // MEGA_ATTN_REFERENCE_ONLY
