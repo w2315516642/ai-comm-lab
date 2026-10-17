@@ -180,8 +180,8 @@ struct Case {
         : n(n_), k(k_), ek(ek_), istride(align_up(k, 8)),
           eistride(align_up(ek, 8)), sfstride(align_up(n, 4)),
           main(5, page, false), extra(7, page, true), q(size_t(n) * H * D),
-          indices(size_t(n) * istride, -1),
-          extra_indices(size_t(n) * eistride, -1), positions(n), lengths(n, k),
+          indices(size_t(n) * istride, 0),
+          extra_indices(size_t(n) * eistride, 0), positions(n), lengths(n, k),
           extra_lengths(n, ek), cos_sin(32 * R), sink(H) {
         check(n > 0 && k > 0 && k % 8 == 0 && ek > 0, "Invalid test shape");
         std::mt19937 rng(seed);
@@ -196,18 +196,16 @@ struct Case {
                 v = from_bf16(bf16(uniform(rng)));
             cache->pack(values);
         }
+        // 有效长度内只生成合法索引，空集合由 length=0 表示。
         const std::vector<int> mt = {3, 0, 4, 1, 2}, et = {6, 2, 5, 0, 4, 1, 3};
         for (int i = 0; i < n; ++i) {
             positions[i] = i % 32;
             for (int j = 0; j < k; ++j)
                 indices[size_t(i) * istride + j] =
-                    j % 7 ? physical_index(int(rng() % main.slots()), mt, page)
-                          : -1;
+                    physical_index(int(rng() % main.slots()), mt, page);
             for (int j = 0; j < ek; ++j)
                 extra_indices[size_t(i) * eistride + j] =
-                    j % 11
-                        ? physical_index(int(rng() % extra.slots()), et, page)
-                        : extra.slots() + 1;
+                    physical_index(int(rng() % extra.slots()), et, page);
         }
         if (n >= 3) {
             lengths[0] = 0;
@@ -247,8 +245,7 @@ inline Reference reference(const Case &c) {
                           int length) {
             for (int j = 0; j < std::min(count, length); ++j) {
                 int id = ids[size_t(i) * stride + j];
-                if (id >= 0 && id < cache.slots())
-                    rows.push_back(cache.decoded.data() + size_t(id) * D);
+                rows.push_back(cache.decoded.data() + size_t(id) * D);
             }
         };
         gather(
@@ -406,9 +403,7 @@ inline void cpu_tests() {
     }
     check(to_e2m1(99) == 7 && to_e2m1(-99) == 15, "FP4 saturation");
     check(
-        physical_index(4, {7, 2, 9}, 4) == 8 &&
-            physical_index(-1, {7, 2, 9}, 4) == -1 &&
-            physical_index(12, {7, 2, 9}, 4) == -1,
+        physical_index(4, {7, 2, 9}, 4) == 8,
         "Page mapping"
     );
     check(q_offset(1, 3, 17) == 32768 + 1024 + 48 + 1, "Q chunk16 offset");
@@ -457,12 +452,12 @@ inline void cpu_tests() {
     std::fill(c.positions.begin(), c.positions.end(), 0);
     c.main.pack(std::vector<float>(c.main.decoded.size(), 1.f));
     c.extra.pack(std::vector<float>(c.extra.decoded.size(), 6.f));
-    std::fill(c.indices.begin(), c.indices.end(), -1);
-    std::fill(c.extra_indices.begin(), c.extra_indices.end(), -1);
+    std::fill(c.lengths.begin(), c.lengths.end(), 0);
+    std::fill(c.extra_lengths.begin(), c.extra_lengths.end(), 0);
     c.indices[0] = 0;
     c.extra_indices[0] = 1;
-    c.lengths[0] = 8;
-    c.extra_lengths[0] = 9;
+    c.lengths[0] = 1;
+    c.extra_lengths[0] = 1;
     std::fill(c.sink.begin(), c.sink.end(), 0);
     c.sink[0] = -INFINITY;
     c.sink[1] = INFINITY;
@@ -715,8 +710,8 @@ void run_correctness() {
             c.use_sink = false;
         }
         if (mode == 1) {
-            std::fill(c.indices.begin(), c.indices.end(), -1);
-            std::fill(c.extra_indices.begin(), c.extra_indices.end(), -1);
+            std::fill(c.lengths.begin(), c.lengths.end(), 0);
+            std::fill(c.extra_lengths.begin(), c.extra_lengths.end(), 0);
         }
         if (mode == 2) { // Larger logits exercise online rescaling without
                          // codec overflow.

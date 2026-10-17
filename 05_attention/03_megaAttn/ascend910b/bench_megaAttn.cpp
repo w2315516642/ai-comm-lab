@@ -56,7 +56,7 @@ Expected ReferenceTile(const mega_test::Case &c, const Stage1Config &p) {
         int stride = extra ? p.extra_indices_stride : p.indices_stride;
         if (local >= cap || local >= length) continue;
         int id = ids[size_t(p.query) * stride + local];
-        if (id < 0 || id >= cache.slots()) continue;
+        // 有效长度内的 id 由 indexer 保证合法。
         r.valid[t] = 1;
         for (int d = 0; d < DIM; ++d)
             r.kv[t * DIM + d] = mega_test::bf16(cache.decoded[size_t(id) * DIM + d]);
@@ -114,7 +114,7 @@ void OracleTests() {
     mega_test::Case c(3, 72, 121, 5);
     auto p = MakeConfig(c, 2, 32, 64);
     auto r = ReferenceTile(c, p);
-    check(r.valid[0] == 1 && r.valid[8] == 0 && r.valid[9] == 1,
+    check(r.valid[0] == 1 && r.valid[7] == 1 && r.valid[8] == 1 && r.valid[9] == 1,
           "Mixed block FP8/FP4 boundary");
     for (int h = 0; h < HEAD_TILE; ++h)
         for (int d = 0; d < DIM; ++d)
