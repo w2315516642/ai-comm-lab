@@ -20,7 +20,10 @@ if(NOT ASCEND_CANN_PACKAGE_PATH)
 endif()
 set(SOC_VERSION "Ascend910B2C" CACHE STRING "Target SoC")
 set(RUN_MODE "npu" CACHE STRING "Ascend execution mode")
-set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+# project() 可能已创建空缓存；CANN 合并脚本要求 build-type 非空。
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 # CANN 安装包的 CMake 模块负责设备编译和 <<<>>> 启动封装。
 foreach(relative tools/tikcpp/ascendc_kernel_cmake compiler/tikcpp/ascendc_kernel_cmake)
     if(EXISTS "${ASCEND_CANN_PACKAGE_PATH}/${relative}/ascendc.cmake")

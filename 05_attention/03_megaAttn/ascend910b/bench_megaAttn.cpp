@@ -160,9 +160,13 @@ struct Runtime {
     aclrtStream stream = nullptr;
     Runtime() {
         if (const char *s = std::getenv("ASCEND_DEVICE_ID")) device = std::stoi(s);
+        std::fprintf(stderr, "NPU: aclInit\n");
         AclCheck(aclInit(nullptr), "aclInit");
+        std::fprintf(stderr, "NPU: aclrtSetDevice(%d)\n", device);
         AclCheck(aclrtSetDevice(device), "aclrtSetDevice");
+        std::fprintf(stderr, "NPU: aclrtCreateStream\n");
         AclCheck(aclrtCreateStream(&stream), "aclrtCreateStream");
+        std::fprintf(stderr, "NPU: runtime ready\n");
     }
     ~Runtime() {
         if (stream) aclrtDestroyStream(stream);
@@ -223,6 +227,7 @@ std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform)
 
 void RunCase(Runtime &rt, const char *name, const mega_test::Case &c,
              const Stage1Config &p, void *tiling, void *workspace) {
+    std::fprintf(stderr, "NPU [%s]: prepare inputs\n", name);
     auto ref = ReferenceTile(c,p);
     DeviceBuffer<uint16_t> q(c.q), q_loaded(Q_ELEMS), q_rope(Q_ELEMS), kv(KV_ELEMS);
     DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes);
@@ -232,8 +237,15 @@ void RunCase(Runtime &rt, const char *name, const mega_test::Case &c,
     DeviceBuffer<Stage1Config> config(std::vector<Stage1Config>{p});
     Stage1Input in{q.data,main.data,extra.data,ids.data,extra_ids.data,rope.data};
     Stage1Output out{q_loaded.data,q_rope.data,kv.data,valid.data,scores.data,status.data};
+    std::fprintf(stderr, "NPU [%s]: launch kernel\n", name);
     launch_mega_attn_stage1(in,out,config.data,tiling,workspace,rt.stream);
-    AclCheck(aclrtSynchronizeStream(rt.stream), "kernel synchronize");
+    std::fprintf(stderr, "NPU [%s]: wait kernel (30 s timeout)\n", name);
+    aclError syncStatus = aclrtSynchronizeStreamWithTimeout(rt.stream, 30000);
+    // 先输出错误，再清理资源，避免清理也阻塞时丢失定位信息。
+    if (syncStatus != ACL_SUCCESS)
+        std::fprintf(stderr, "NPU [%s]: synchronize failed, code=%d\n", name, int(syncStatus));
+    AclCheck(syncStatus, "kernel synchronize");
+    std::fprintf(stderr, "NPU [%s]: kernel complete, checking outputs\n", name);
     q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard();
     extra_ids.CheckGuard(); rope.CheckGuard(); config.CheckGuard();
     q_loaded.CheckGuard(); q_rope.CheckGuard(); kv.CheckGuard(); valid.CheckGuard();
@@ -255,10 +267,14 @@ void RunCase(Runtime &rt, const char *name, const mega_test::Case &c,
 
 void NpuTests() {
     Runtime rt;
+    std::fprintf(stderr, "NPU: query platform\n");
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     check(platform != nullptr,"Cannot get Ascend platform");
+    std::fprintf(stderr, "NPU: create and upload tiling\n");
     DeviceBuffer<uint8_t> tiling(MakeCubeTiling(*platform));
+    std::fprintf(stderr, "NPU: allocate workspace\n");
     DeviceBuffer<uint8_t> workspace(platform->GetLibApiWorkSpaceSize());
+    std::fprintf(stderr, "NPU: generate test inputs\n");
     mega_test::Case c(3,72,121,65,17);
     RunCase(rt,"FP8",c,MakeConfig(c,2,0,0),tiling.data,workspace.data);
     RunCase(rt,"mixed FP8/FP4",c,MakeConfig(c,2,16,64),tiling.data,workspace.data);
