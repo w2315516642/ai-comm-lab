@@ -3,6 +3,7 @@
 #include "../sm100/bench_megaAttn.cu"
 #undef MEGA_ATTN_REFERENCE_ONLY
 #include "megaAttn_v1.h"
+#include "megaAttn_v2.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -307,6 +308,28 @@ void OracleTests() {
     ExpectFailure([&]{ CompareFloats(bad_mask, empty.masked, 0, 0, "mask"); }, "Mask checker");
     std::puts("PASS CPU: codecs, Q/KV layouts, mixed/tail/empty tiles and QK oracle");
 }
+// 穷举设备查表的全部编码，对照原有独立 codec，包含非规格化数和 NaN。
+void V2CodecTests() {
+    for (int code=0;code<256;++code) {
+        float got=std::bit_cast<float>(mega_ascend_v2::E4M3Bits(uint8_t(code)));
+        float ref=mega_test::e4m3(uint8_t(code));
+        check(std::isnan(ref)?std::isnan(got):std::bit_cast<uint32_t>(got)==std::bit_cast<uint32_t>(ref),
+              "v2 E4M3 table bits");
+        got=std::bit_cast<float>(mega_ascend_v2::E8M0Bits(uint8_t(code)));
+        ref=code==255?NAN:std::ldexp(1.0f,code-127);
+        check(std::isnan(ref)?std::isnan(got):got==ref,"v2 UE8M0 table bits");
+    }
+    // v2 的 NZ 布局应与原始 Q 布局相同；所有 64x512 元素各占唯一位置。
+    std::vector<bool> occupied(64*512);
+    for (int h=0;h<64;++h) for (int d=0;d<512;++d) {
+        size_t nz=(d/16)*64*16+h*16+d%16;
+        check(nz==mega_test::q_offset(0,h,d) && !occupied[nz],"v2 NZ layout");
+        occupied[nz]=true;
+    }
+    std::printf("PASS CPU v2: exhaustive codec tables; NZ layout; UB=%d+%d bytes, L1=200 KiB\n",
+                mega_ascend_v2::USER_UB_BYTES,2*mega_ascend_v2::MATMUL_UB_BYTES);
+}
+
 template<class F> void ForEachCase(F run) {
     mega_test::Case mixed(3,72,121,65,17);
     run("mixed/tail/empty",mixed);
@@ -409,21 +432,25 @@ template<class T> struct DeviceBuffer {
     }
 };
 
-// 固定 QK/PV 形状的 Matmul tiling，与 kernel 内的 GM 暂存布局一致。
-std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, int ubBytes = 16*1024) {
+// 固定 QK/PV 形状：v1 从 GM 读 ND，v2 从 L1 读 NZ；结果均写 GM。
+std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, bool v2 = false) {
     using namespace matmul_tiling;
     MatmulApiTiling api(platform);
-    api.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, false);
-    api.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, !pv);
+    auto pos=v2?TPosition::TSCM:TPosition::GM;
+    auto format=v2?CubeFormat::NZ:CubeFormat::ND;
+    api.SetAType(pos, format, DataType::DT_BF16, false);
+    api.SetBType(pos, format, DataType::DT_BF16, !pv);
     api.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
     api.SetBias(false);
-    int n = pv ? DIM : KV_TILE, k = pv ? KV_TILE : DIM;
-    api.SetShape(HEAD_TILE, n, k);
-    api.SetOrgShape(HEAD_TILE, n, k);
-    // 用户缓冲约 153 KiB；QK/PV 各限 16 KiB，总量不超过 192 KiB UB。
-    api.SetBufferSpace(-1, -1, ubBytes);
+    int tile=v2?mega_ascend_v2::KV_TILE:KV_TILE;
+    int n = pv ? DIM : tile, k = pv ? tile : DIM;
+    int heads=v2?HEADS:HEAD_TILE;
+    api.SetShape(heads, n, k);
+    api.SetOrgShape(heads, n, k);
+    // v2 的用户 L1 占 200 KiB，两个 Matmul 各留 64 KiB；UB 预算见 v2.h。
+    api.SetBufferSpace(v2?64*1024:-1, -1, v2?mega_ascend_v2::MATMUL_UB_BYTES:16*1024);
     optiling::TCubeTiling tiling;
-    check(api.GetTiling(tiling) != -1, "QK tiling failed");
+    check(api.GetTiling(tiling) != -1, pv?"PV tiling failed":"QK tiling failed");
     std::vector<uint8_t> bytes(tiling.GetDataSize());
     tiling.SaveToBuffer(bytes.data(), bytes.size());
     return bytes;
@@ -441,10 +468,10 @@ void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
             float want=ref.out[base+j], value=got[base+j];
             float tolerance=.003f+.025f*std::abs(want)+amax/16;
             if (!std::isfinite(value) || std::abs(value-want)>tolerance)
-                throw std::runtime_error("v1 quantized output mismatch at "+std::to_string(base+j));
+                throw std::runtime_error("quantized output mismatch at "+std::to_string(base+j));
         }
     }
-    CompareFloats(lse,ref.lse,.003f,.002f,"v1 LSE");
+    CompareFloats(lse,ref.lse,.003f,.002f,"reference LSE");
     for (int q=0; q<c.n; ++q) for (int h=0; h<HEADS; ++h) {
         bool zero=(c.lengths[q]==0 && c.extra_lengths[q]==0) || (c.use_sink && c.sink[h]==INFINITY);
         if (zero) for (int d=0; d<DIM; ++d)
@@ -484,9 +511,78 @@ template<class F> void MeasureBatch(Runtime &rt,const char *name,int queries,F l
                 name,ms*1000,double(queries)*1000/ms,samples,repeats);
 }
 
+// v2 与同一输入的 v1/独立 CPU 参考对拍；核数变化仍须保持逐字节一致。
+void RunV2Case(Runtime &rt,const char *name,const mega_test::Case &c,uint32_t availableCores,
+               const Input &in,const Output &out,DeviceBuffer<uint8_t> &packed,
+               DeviceBuffer<uint32_t> &scales,DeviceBuffer<float> &lse,
+               void *qkTiling,void *pvTiling,void *workspace,bool benchmark) {
+    auto ref=mega_test::reference(c);
+    auto v1Lse=lse.Download();
+    auto v1Output=mega_test::unpack_output(packed.Download(),scales.Download(),c.n,c.sfstride);
+    std::vector<mega_ascend_v2::QueryConfig> queries;
+    for (int q=0;q<c.n;++q) queries.push_back({q,c.positions[q],c.k,c.ek,c.lengths[q],c.extra_lengths[q],
+        c.main.size,c.main.stride,c.extra.size,c.extra.stride,c.istride,c.eistride});
+    uint32_t maxBlocks=std::min(uint32_t(c.n),availableCores);
+    DeviceBuffer<mega_ascend_v2::QueryConfig> configs(queries);
+    DeviceBuffer<uint8_t> scratch(mega_ascend_v2::ScratchBytes(maxBlocks));
+    DeviceBuffer<mega_ascend_v2::Profile> profiles(c.n);
+    auto launch=[&](uint32_t blocks,mega_ascend_v2::Profile *profile=nullptr) {
+        launch_mega_attn_v2(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,rt.stream,profile);
+    };
+    std::vector<uint32_t> blockCounts{1};
+    for (uint32_t n:{2u,5u,maxBlocks})
+        if (n<=maxBlocks && std::find(blockCounts.begin(),blockCounts.end(),n)==blockCounts.end()) blockCounts.push_back(n);
+    std::vector<uint8_t> serialPacked;
+    std::vector<uint32_t> serialScales;
+    std::vector<float> serialLse;
+    for (uint32_t blocks:blockCounts) {
+        packed.Upload(std::vector<uint8_t>(packed.count,0xa5));
+        scales.Upload(std::vector<uint32_t>(scales.count,0xa5a5a5a5u));
+        lse.Upload(std::vector<float>(lse.count,NAN));
+        std::fprintf(stderr,"NPU v2 [%s]: queries=%d groups=%u\n",name,c.n,blocks);
+        launch(blocks);
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"v2 synchronize");
+        auto data=packed.Download(); auto sf=scales.Download(); auto ls=lse.Download();
+        CompareQuantized(c,ref,data,sf,ls);
+        CompareFloats(ls,v1Lse,.003f,.002f,"v2 vs v1 LSE");
+        auto values=mega_test::unpack_output(data,sf,c.n,c.sfstride);
+        for (size_t base=0;base<values.size();base+=32) {
+            float amax=0;
+            for (int j=0;j<32;++j) amax=std::max(amax,std::abs(ref.out[base+j]));
+            for (int j=0;j<32;++j)
+                check(std::abs(values[base+j]-v1Output[base+j])<=.006f+.05f*std::abs(ref.out[base+j])+amax/8,
+                      "v2 vs v1 quantized output");
+        }
+        if (blocks==1) { serialPacked=data; serialScales=sf; serialLse=ls; }
+        else {
+            check(data==serialPacked && sf==serialScales,"v2 changed with block count");
+            CompareFloats(ls,serialLse,0,0,"v2 multi-core LSE");
+        }
+        packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard(); scratch.CheckGuard();
+        std::printf("PASS NPU v2: %s queries=%d groups=%u\n",name,c.n,blocks);
+    }
+    if (benchmark) {
+        std::printf("BENCH v2: same input as v1; queries=%d groups=%u, 64 heads/group\n",c.n,maxBlocks);
+        MeasureBatch(rt,"v2",c.n,[&] { launch(maxBlocks); });
+        // 与无计时版本逐字节比较，保证诊断开关没有改变结果。
+        launch(maxBlocks,profiles.data);
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"v2 profile synchronize");
+        check(packed.Download()==serialPacked && scales.Download()==serialScales,"v2 profiling changed outputs");
+        CompareFloats(lse.Download(),serialLse,0,0,"v2 profiling LSE");
+        auto samples=profiles.Download();
+        const char *labels[]={"query","prepare-kv","wait-qk/load","softmax","wait-pv","accumulate","finish","total"};
+        std::puts("PROFILE v2: AIV cycles/query, includes waits; asynchronous work overlaps; excludes InitTables");
+        for (int part=0;part<mega_ascend_v2::ProfileCount;++part) {
+            double sum=0; for (const auto &sample:samples) sum+=sample.cycles[part];
+            std::printf("  %-14s %.0f\n",labels[part],sum/c.n);
+        }
+    }
+    configs.CheckGuard(); scratch.CheckGuard(); profiles.CheckGuard();
+}
+
 // 同一组输入分别用一个核组和多个核组运行，检查跨任务复用和核间隔离。
 void RunNpuCase(Runtime &rt, const char *name, const mega_test::Case &c, uint32_t availableCores,
-                void *qkTiling, void *pvTiling, void *workspace, bool benchmark=false) {
+                void *qkTiling, void *pvTiling, void *v2Qk, void *v2Pv, void *workspace, bool benchmark=false) {
     auto ref=mega_test::reference(c);
     std::vector<TaskConfig> tasks;
     for (int query=0; query<c.n; ++query)
@@ -542,6 +638,7 @@ void RunNpuCase(Runtime &rt, const char *name, const mega_test::Case &c, uint32_
         MeasureBatch(rt,"v1",c.n,[&] { launch(maxBlocks); });
         CompareQuantized(c,ref,packed.Download(),scales.Download(),lse.Download());
     }
+    RunV2Case(rt,name,c,availableCores,in,out,packed,scales,lse,v2Qk,v2Pv,workspace,benchmark);
     q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
     rope.CheckGuard(); sink.CheckGuard(); configs.CheckGuard(); scratch.CheckGuard();
     packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
@@ -553,11 +650,13 @@ void NpuTests() {
     check(platform != nullptr,"Cannot get Ascend platform");
     DeviceBuffer<uint8_t> qkTiling(MakeCubeTiling(*platform,false));
     DeviceBuffer<uint8_t> pvTiling(MakeCubeTiling(*platform,true));
+    DeviceBuffer<uint8_t> v2Qk(MakeCubeTiling(*platform,false,true));
+    DeviceBuffer<uint8_t> v2Pv(MakeCubeTiling(*platform,true,true));
     DeviceBuffer<uint8_t> workspace(platform->GetLibApiWorkSpaceSize());
     ForEachCase([&](const char *name, const mega_test::Case &c, bool bench=false) {
-        RunNpuCase(rt,name,c,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,workspace.data,bench);
+        RunNpuCase(rt,name,c,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,v2Qk.data,v2Pv.data,workspace.data,bench);
     });
-    qkTiling.CheckGuard(); pvTiling.CheckGuard(); workspace.CheckGuard();
+    qkTiling.CheckGuard(); pvTiling.CheckGuard(); v2Qk.CheckGuard(); v2Pv.CheckGuard(); workspace.CheckGuard();
 }
 } // namespace
 #endif
@@ -568,6 +667,7 @@ int main() {
         OracleTests();
         OnlineOracleTests();
         FinalOracleTests();
+        V2CodecTests();
 #ifdef MEGA_ASCEND_CPU_ONLY
         ForEachCase([](const char *name, const mega_test::Case &c, bool = false) {
             auto ref=mega_test::reference(c);
@@ -579,7 +679,7 @@ int main() {
         std::puts("CPU oracle only: device execution NOT tested.");
 #else
         NpuTests();
-        std::puts("PASS: v1 complete operator correctness and benchmark");
+        std::puts("PASS: v1/v2 complete operator correctness and benchmark");
 #endif
         return 0;
     } catch (const std::exception &e) {

@@ -23,6 +23,6 @@ print(soc.decode())
 PY_SOC
 )"
 echo "Target SoC: $SOC_VERSION"
-cmake -S . -B build/v1 -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" -DSOC_VERSION="$SOC_VERSION"
-cmake --build build/v1 -j "$(nproc)"
-exec ./build/v1/bench_megaAttn
+cmake -S . -B build/v2 -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" -DSOC_VERSION="$SOC_VERSION"
+cmake --build build/v2 -j "$(nproc)"
+exec ./build/v2/bench_megaAttn

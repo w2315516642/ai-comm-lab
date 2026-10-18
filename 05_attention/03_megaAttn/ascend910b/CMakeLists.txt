@@ -35,14 +35,17 @@ if(NOT ASCENDC_CMAKE_DIR)
     message(FATAL_ERROR "Cannot find ascendc.cmake under ${ASCEND_CANN_PACKAGE_PATH}; check Toolkit installation")
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
+# 每个版本独立生成混合核元数据，避免 CANN 9.0 的同源多入口编号问题。
 ascendc_library(mega_attn_kernel STATIC megaAttn_v1.cpp)
+ascendc_library(mega_attn_kernel_v2 STATIC megaAttn_v2.cpp)
 # 让启动封装初始化 Matmul 通信区并通知 AIV；workspace 必须是核函数最后一个参数。
 ascendc_compile_definitions(mega_attn_kernel PRIVATE HAVE_WORKSPACE)
+ascendc_compile_definitions(mega_attn_kernel_v2 PRIVATE HAVE_WORKSPACE)
 target_include_directories(bench_megaAttn PRIVATE
     "${ASCEND_CANN_PACKAGE_PATH}/include"
     "${ASCEND_CANN_PACKAGE_PATH}/include/experiment")
 target_link_directories(bench_megaAttn PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 target_compile_definitions(bench_megaAttn PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
-target_link_libraries(bench_megaAttn PRIVATE mega_attn_kernel ascendcl
+target_link_libraries(bench_megaAttn PRIVATE mega_attn_kernel mega_attn_kernel_v2 ascendcl
     tiling_api platform register graph_base ascendalog dl)
 set_target_properties(bench_megaAttn PROPERTIES BUILD_RPATH "${ASCEND_CANN_PACKAGE_PATH}/lib64")
