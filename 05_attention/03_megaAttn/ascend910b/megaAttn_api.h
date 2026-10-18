@@ -27,6 +27,16 @@ struct Stage2Output {
     float *row_max;    // [16]，最终 m；全空时 -inf
     float *row_sum;    // [16]，最终 l=sum(exp(score-m))；全空时 0
 };
+// 同一多核调度器下的三条路径：标量基线、同步向量化、向量化加 KV 预取。
+enum class Stage4Mode : int32_t { Reference = 0, Vector = 1, Pipeline = 2 };
+
+// 阶段 3 的完整输出，布局沿用 SM100；一个 kernel 只写 cfg 指定的 16 个 head。
+struct Stage3Output {
+    uint8_t *fp8;      // [N,8,16,8,32]，每个元素一个 E4M3 字节
+    uint32_t *scales;  // [256,sf_stride]，每个 word 打包四个 UE8M0 指数
+    float *lse;        // [N,64]，不含 sink；全空行约定为 +inf
+    int32_t sf_stride; // >= N，且为 4 的倍数
+};
 } // namespace mega_ascend
 
 // config、cube_tiling、workspace 都是设备地址；stream 是 aclrtStream。
@@ -41,3 +51,24 @@ extern "C" void launch_mega_attn_stage2(
     const mega_ascend::Stage1Output &scratch,
     const mega_ascend::Stage2Output &out,
     void *config, void *qk_tiling, void *pv_tiling, void *workspace, void *stream);
+
+// sink 为 [64] FP32 或 nullptr；online.output 在此导出当前步骤的 FP32 输出观测点。
+extern "C" void launch_mega_attn_stage3(
+    const mega_ascend::Stage1Input &in,
+    const mega_ascend::Stage1Output &scratch,
+    const mega_ascend::Stage2Output &online,
+    const float *sink, const mega_ascend::Stage3Output &out,
+    void *config, void *qk_tiling, void *pv_tiling, void *workspace, void *stream);
+
+// configs 是 task_count 个 Stage1Config；每项指定一个 query 和 16 个 head。
+// scratch/online 的各字段分配 block_num 份；唯独 status 分配 task_count*8 个 int32。
+// out 仍是完整输出；1 <= block_num <= min(task_count, 可用 AIC 核数)。
+// Vector/Pipeline 不写 q_loaded、valid、output、row_max、row_sum；scores 暂存原始 QK。
+extern "C" void launch_mega_attn_stage4(
+    const mega_ascend::Stage1Input &in,
+    const mega_ascend::Stage1Output &scratch,
+    const mega_ascend::Stage2Output &online,
+    const float *sink, const mega_ascend::Stage3Output &out,
+    uint32_t task_count, uint32_t block_num,
+    void *configs, void *qk_tiling, void *pv_tiling, void *workspace, void *stream,
+    mega_ascend::Stage4Mode mode = mega_ascend::Stage4Mode::Pipeline);

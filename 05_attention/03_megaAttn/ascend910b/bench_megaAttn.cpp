@@ -173,6 +173,104 @@ void OnlineOracleTests() {
     std::puts("PASS CPU: stage-2 full softmax oracle, empty/uniform/rising-max");
 }
 
+
+// 末处理的 CPU 参考；有效 softmax 分母用双精度计算，空行沿用原版 LSE=+inf。
+struct FinalExpected {
+    std::vector<float> output, lse;
+};
+FinalExpected ReferenceFinal(const mega_test::Case &c, const Stage1Config &p, bool rotate) {
+    auto online = ReferenceOnline(c,p);
+    FinalExpected r{online.output,std::vector<float>(HEAD_TILE,INFINITY)};
+    for (int h=0; h<HEAD_TILE; ++h) {
+        if (online.row_sum[h]==0) continue;
+        double lse = double(online.row_max[h])+std::log(double(online.row_sum[h]));
+        r.lse[h]=float(lse);
+        double sink = c.use_sink ? c.sink[p.head_begin+h] : -INFINITY;
+        // logaddexp 求含 sink 的总分母，独立于设备侧的分段 sigmoid 写法。
+        double gate=0;
+        if (sink!=INFINITY) {
+            double m=std::max(lse,sink);
+            gate=std::exp(lse-m)/(std::exp(lse-m)+std::exp(sink-m));
+        }
+        for (int d=0; d<DIM; ++d) r.output[h*DIM+d]*=float(gate);
+        if (!rotate) continue;
+        const float *cs=c.cos_sin.data()+p.position*ROPE_DIM;
+        for (int j=0; j<ROPE_DIM/2; ++j) {
+            int d=h*DIM+DIM-ROPE_DIM+2*j;
+            float a=r.output[d], b=r.output[d+1];
+            r.output[d]=std::fma(a,cs[j],b*cs[32+j]);
+            r.output[d+1]=std::fma(-a,cs[32+j],b*cs[j]);
+        }
+    }
+    return r;
+}
+
+// 从量化前的实际 FP32 输出核对字节和布局，避免把 BF16 attention 误差误判为编码错误。
+void PackFinalTile(const std::vector<float> &input, int q, int head, int stride,
+                   std::vector<uint8_t> &data, std::vector<uint32_t> &scales) {
+    for (int h=0; h<HEAD_TILE; ++h) {
+        int gh=head+h;
+        for (int group=0; group<DIM/32; ++group) {
+            float amax=0;
+            for (int j=0; j<32; ++j) amax=std::max(amax,std::abs(input[h*DIM+group*32+j]));
+            float required=std::max(amax,1e-4f)/448.f;
+            int e=int(std::ceil(std::log2(double(required))));
+            float scale=std::ldexp(1.f,e);
+            int slot=group*8+gh%8;
+            size_t word=size_t((gh/8)*32+slot/4)*stride+q;
+            int shift=8*(slot%4);
+            scales[word]=(scales[word]&~(0xffu<<shift))|(uint32_t(e+127)<<shift);
+            for (int j=0; j<32; ++j)
+                data[mega_test::out_offset(q,gh,group*32+j)]=
+                    mega_test::to_e4m3(input[h*DIM+group*32+j]/scale);
+        }
+    }
+}
+
+void FinalOracleTests() {
+    mega_test::Case c(3,8,9,5);
+    std::fill(c.q.begin(),c.q.end(),mega_test::bf16(0));
+    c.main.pack(std::vector<float>(c.main.decoded.size(),6));
+    c.extra.pack(std::vector<float>(c.extra.decoded.size(),6));
+    std::fill(c.sink.begin(),c.sink.end(),std::log(float(c.k+c.ek)));
+    auto p=MakeConfig(c,2,0,0);
+    auto half=ReferenceFinal(c,p,false);
+    for (float x:half.output) check(std::abs(x-3.f)<1e-6f,"Sink doubles denominator");
+    for (float x:half.lse) check(std::abs(x-std::log(float(c.k+c.ek)))<1e-6f,"LSE excludes sink");
+    c.sink[0]=-INFINITY; c.sink[1]=INFINITY; c.sink[2]=1000; c.sink[3]=-1000;
+    auto extremes=ReferenceFinal(c,p,false);
+    for (int d=0; d<DIM; ++d) {
+        check(extremes.output[d]==6 && extremes.output[DIM+d]==0,"Infinite sink");
+        check(extremes.output[2*DIM+d]==0 && extremes.output[3*DIM+d]==6,"Stable finite sink");
+    }
+    auto empty=ReferenceFinal(c,MakeConfig(c,0,0,0),true);
+    for (float x:empty.lse) check(x==INFINITY,"Empty final LSE");
+    for (float x:empty.output) check(x==0,"Empty final output");
+    c.use_sink=false;
+    auto r=ReferenceFinal(c,p,true);
+    auto original=mega_test::reference(c);
+    size_t begin=size_t(p.query)*HEADS*DIM;
+    CompareFloats(r.output,{original.out.begin()+begin,original.out.begin()+begin+Q_ELEMS},1e-6f,1e-6f,"Original final semantics");
+    // 用可精确编码的正负常量验证 scale 取整、跨 head/query 索引与 padding。
+    std::vector<float> input(Q_ELEMS);
+    std::vector<uint8_t> data(size_t(c.n)*HEADS*DIM,0xa5);
+    std::vector<uint32_t> scales(256*c.sfstride,0xa5a5a5a5u);
+    for (int h=0; h<HEAD_TILE; ++h)
+        for (int d=0; d<DIM; ++d) input[h*DIM+d]=(h%2?-1.f:1.f)*std::ldexp(448.f,(d/32)%5-4);
+    PackFinalTile(input,2,16,c.sfstride,data,scales);
+    auto unpacked=mega_test::unpack_output(data,scales,c.n,c.sfstride);
+    begin=(size_t(2)*HEADS+16)*DIM;
+    CompareFloats({unpacked.begin()+begin,unpacked.begin()+begin+Q_ELEMS},input,0,0,"Output packing");
+    for (int word=0; word<256; ++word)
+        for (int q=0; q<c.sfstride; ++q)
+            if (word<64 || word>=128 || q!=2)
+                check(scales[word*c.sfstride+q]==0xa5a5a5a5u,"Scale writes outside tile");
+    std::fill(input.begin(),input.end(),0);
+    PackFinalTile(input,0,0,c.sfstride,data,scales);
+    check(scales[0]==0x69696969u,"Zero amax scale must be 2^-22 (UE8M0=105)");
+    std::puts("PASS CPU: stage-3 sink/LSE, inverse RoPE, FP8/UE8M0 and output layouts");
+}
+
 void OracleTests() {
     mega_test::cpu_tests();
     mega_test::Case c(3, 72, 121, 5);
@@ -372,6 +470,299 @@ void RunOnlineCase(Runtime &rt, const char *name, const mega_test::Case &c,
     std::printf("PASS NPU stage2: %s\n",name);
 }
 
+
+// 每个 query 的四个 head tile 串行复用 scratch；只验证语义，不在这里计吞吐。
+int RunFinalCase(Runtime &rt, const char *name, const mega_test::Case &c,
+                 void *qkTiling, void *pvTiling, void *workspace) {
+    DeviceBuffer<uint16_t> q(c.q), qLoaded(Q_ELEMS), qRope(Q_ELEMS), kv(KV_ELEMS), prob(SCORE_ELEMS);
+    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes), packed(size_t(c.n)*HEADS*DIM);
+    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(KV_TILE);
+    DeviceBuffer<float> rope(c.cos_sin), sink(c.sink), scores(SCORE_ELEMS), pv(Q_ELEMS), output(Q_ELEMS);
+    DeviceBuffer<float> rowMax(HEAD_TILE), rowSum(HEAD_TILE), lse(size_t(c.n)*HEADS);
+    DeviceBuffer<uint32_t> scales(256*c.sfstride);
+    DeviceBuffer<int32_t> status(std::vector<int32_t>(8,-1));
+    DeviceBuffer<Stage1Config> config(1);
+    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
+    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
+    Stage2Output online{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
+    Stage3Output final{packed.data,scales.data,lse.data,c.sfstride};
+    std::vector<uint8_t> expectedPacked(packed.count,0xa5);
+    std::vector<uint32_t> expectedScales(scales.count,0xa5a5a5a5u);
+    std::vector<float> expectedLse(lse.count,INFINITY);
+    int stopped=-1;
+    std::fprintf(stderr,"NPU stage3 [%s]: %d query/head tiles\n",name,c.n*4);
+    for (int query=0; query<c.n; ++query) for (int head=0; head<HEADS; head+=HEAD_TILE) {
+        auto p=MakeConfig(c,query,head,0);
+        config.Upload({p}); status.Upload(std::vector<int32_t>(8,-1));
+        launch_mega_attn_stage3(in,scratch,online,c.use_sink?sink.data:nullptr,final,
+                              config.data,qkTiling,pvTiling,workspace,rt.stream);
+        auto sync=aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
+        if (sync!=ACL_SUCCESS) std::fprintf(stderr,"NPU stage3 [%s] q=%d h=%d: sync=%d\n",name,query,head,int(sync));
+        AclCheck(sync,"stage3 synchronize");
+        int step=status.Download()[0];
+        check(step==0 || (step>=20 && step<=22),"Stage3 status: earlier stage failed or no completion");
+        if (stopped<0) stopped=step;
+        check(step==stopped,"Inconsistent stage3 completion");
+        auto got=output.Download();
+        if (step==int(Step::ApplySinkAndLse)) {
+            CompareFloats(got,ReferenceOnline(c,p).output,.002f,.02f,"Stage3 online prerequisite");
+            continue;
+        }
+        auto ref=ReferenceFinal(c,p,step!=int(Step::ApplyOutputRope));
+        CompareFloats(got,ref.output,.003f,.03f,"Stage3 FP32 output");
+        std::copy(ref.lse.begin(),ref.lse.end(),expectedLse.begin()+query*HEADS+head);
+        if (p.length==0 && p.extra_length==0)
+            CompareFloats(got,std::vector<float>(Q_ELEMS,0),0,0,"Empty final output");
+        for (int h=0; h<HEAD_TILE; ++h) if (c.use_sink && c.sink[head+h]==INFINITY)
+            for (int d=0; d<DIM; ++d) check(got[h*DIM+d]==0,"Positive infinite sink must zero output");
+        if (step==0) PackFinalTile(got,query,head,c.sfstride,expectedPacked,expectedScales);
+    }
+    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
+    rope.CheckGuard(); sink.CheckGuard(); config.CheckGuard(); qLoaded.CheckGuard(); qRope.CheckGuard();
+    kv.CheckGuard(); valid.CheckGuard(); scores.CheckGuard(); status.CheckGuard(); prob.CheckGuard();
+    pv.CheckGuard(); output.CheckGuard(); rowMax.CheckGuard(); rowSum.CheckGuard();
+    packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
+    if (stopped!=int(Step::ApplySinkAndLse))
+        CompareFloats(lse.Download(),expectedLse,.003f,.002f,"LSE (without sink)");
+    // TODO 时量化输出必须保持 poison；完成后逐字节检查，并检查 sf_stride 的 padding。
+    check(packed.Download()==expectedPacked,"FP8 bytes/layout mismatch");
+    check(scales.Download()==expectedScales,"UE8M0 scale/layout/padding mismatch");
+    std::printf("%s NPU stage3: %s%s%s\n",stopped==0?"PASS":"PARTIAL",name,
+                stopped==0?"":"; next TODO = ",stopped==0?"":StepName(stopped));
+    return stopped;
+}
+
+void FinalNpuTests(Runtime &rt, void *qkTiling, void *pvTiling, void *workspace) {
+    int missing=0;
+    auto run=[&](const char *name,const mega_test::Case &c) {
+        int step=RunFinalCase(rt,name,c,qkTiling,pvTiling,workspace);
+        if (step!=0) missing=step;
+    };
+    mega_test::Case mixed(3,72,121,65,17);
+    run("mixed/tail/empty + sink + nonzero RoPE",mixed);
+    mixed.use_sink=false;
+    run("null sink",mixed);
+    mega_test::Case extremes(1,8,9,5);
+    for (int h=0; h<HEADS; ++h) {
+        const float values[]={-INFINITY,INFINITY,-1000.f,1000.f};
+        extremes.sink[h]=values[h%4];
+    }
+    run("finite/infinite extreme sinks",extremes);
+    extremes.main.pack(std::vector<float>(extremes.main.decoded.size(),0));
+    extremes.extra.pack(std::vector<float>(extremes.extra.decoded.size(),0));
+    run("zero output quantization floor",extremes);
+    if (missing) throw std::runtime_error(std::string("TODO stage3: ")+StepName(missing));
+}
+
+
+
+// 输出量化会在舍入边界改变字节；按每组 amax/16 的 E4M3 半步误差检查数值。
+void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
+                      const std::vector<uint8_t> &packed, const std::vector<uint32_t> &scales,
+                      const std::vector<float> &lse) {
+    auto got=mega_test::unpack_output(packed,scales,c.n,c.sfstride);
+    for (size_t base=0; base<ref.out.size(); base+=32) {
+        float amax=0;
+        for (int j=0; j<32; ++j) amax=std::max(amax,std::abs(ref.out[base+j]));
+        for (int j=0; j<32; ++j) {
+            float want=ref.out[base+j], value=got[base+j];
+            float tolerance=.003f+.025f*std::abs(want)+amax/16;
+            if (!std::isfinite(value) || std::abs(value-want)>tolerance)
+                throw std::runtime_error("Optimized quantized output mismatch at "+std::to_string(base+j));
+        }
+    }
+    CompareFloats(lse,ref.lse,.003f,.002f,"Optimized LSE");
+    for (int q=0; q<c.n; ++q) for (int h=0; h<HEADS; ++h) {
+        bool zero=(c.lengths[q]==0 && c.extra_lengths[q]==0) || (c.use_sink && c.sink[h]==INFINITY);
+        if (zero) for (int d=0; d<DIM; ++d)
+            check(got[(size_t(q)*HEADS+h)*DIM+d]==0,"Empty/sink-inf output must be zero");
+    }
+    for (int word=0; word<256; ++word) for (int q=c.n; q<c.sfstride; ++q)
+        check(scales[word*c.sfstride+q]==0xa5a5a5a5u,"Scale padding overwritten");
+}
+
+// 一次样本计时包含 5 个完整 batch；不含分配、H2D、D2H 和 CPU 对拍。
+struct DeviceTimer {
+    aclrtEvent begin=nullptr, end=nullptr;
+    DeviceTimer() {
+        AclCheck(aclrtCreateEventWithFlag(&begin,ACL_EVENT_TIME_LINE),"create timing event");
+        AclCheck(aclrtCreateEventWithFlag(&end,ACL_EVENT_TIME_LINE),"create timing event");
+    }
+    ~DeviceTimer() { if (end) aclrtDestroyEvent(end); if (begin) aclrtDestroyEvent(begin); }
+};
+template<class F> void MeasureBatch(Runtime &rt,const char *name,int queries,F launch) {
+    constexpr int warmup=2, repeats=5, samples=3;
+    for (int i=0; i<warmup; ++i) launch();
+    AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"benchmark warmup");
+    DeviceTimer timer;
+    std::array<float,samples> times{};
+    for (int sample=0; sample<samples; ++sample) {
+        AclCheck(aclrtRecordEvent(timer.begin,rt.stream),"record begin");
+        for (int i=0; i<repeats; ++i) launch();
+        AclCheck(aclrtRecordEvent(timer.end,rt.stream),"record end");
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"benchmark synchronize");
+        AclCheck(aclrtEventElapsedTime(&times[sample],timer.begin,timer.end),"event elapsed time");
+        times[sample]/=repeats;
+    }
+    std::sort(times.begin(),times.end());
+    float ms=times[samples/2];
+    check(ms>0 && std::isfinite(ms),"Invalid benchmark duration");
+    std::printf("BENCH %-20s batch_us=%10.3f query/s=%12.1f (median of %d x %d)\n",
+                name,ms*1000,double(queries)*1000/ms,samples,repeats);
+}
+
+// 与阶段 3 的逐任务串行结果逐字节比较，检查任务遗漏、核间踩踏和 scale padding。
+void RunStage4Case(Runtime &rt, const char *name, const mega_test::Case &c, uint32_t availableCores,
+                   void *qkTiling, void *pvTiling, void *workspace, bool benchmark=false) {
+    auto ref=mega_test::reference(c);
+    std::vector<Stage1Config> tasks;
+    for (int q=0; q<c.n; ++q)
+        for (int h=0; h<HEADS; h+=HEAD_TILE) tasks.push_back(MakeConfig(c,q,h,0));
+    uint32_t taskCount=uint32_t(tasks.size());
+    uint32_t maxBlocks=std::min(taskCount,availableCores);
+    check(maxBlocks>0,"No available AIC cores");
+    DeviceBuffer<uint16_t> q(c.q), qLoaded(maxBlocks*Q_ELEMS), qRope(maxBlocks*Q_ELEMS);
+    DeviceBuffer<uint16_t> kv(maxBlocks*KV_ELEMS), prob(maxBlocks*SCORE_ELEMS);
+    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes), packed(size_t(c.n)*HEADS*DIM);
+    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(maxBlocks*KV_TILE);
+    DeviceBuffer<float> rope(c.cos_sin), sink(c.sink), scores(maxBlocks*SCORE_ELEMS);
+    DeviceBuffer<float> pv(maxBlocks*Q_ELEMS), output(maxBlocks*Q_ELEMS);
+    DeviceBuffer<float> rowMax(maxBlocks*HEAD_TILE), rowSum(maxBlocks*HEAD_TILE), lse(size_t(c.n)*HEADS);
+    DeviceBuffer<uint32_t> scales(256*c.sfstride);
+    DeviceBuffer<int32_t> status(std::vector<int32_t>(taskCount*8,-1));
+    DeviceBuffer<Stage1Config> configs(tasks);
+    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
+    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
+    Stage2Output online{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
+    Stage3Output final{packed.data,scales.data,lse.data,c.sfstride};
+    std::fprintf(stderr,"NPU stage4: serial baseline, %u tasks\n",taskCount);
+    for (uint32_t task=0; task<taskCount; ++task) {
+        auto serialScratch=scratch;
+        serialScratch.status=status.data+task*8;
+        launch_mega_attn_stage3(in,serialScratch,online,c.use_sink?sink.data:nullptr,final,
+                              configs.data+task,qkTiling,pvTiling,workspace,rt.stream);
+    }
+    AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"stage4 serial baseline synchronize");
+    auto serialStatus=status.Download();
+    for (uint32_t task=0; task<taskCount; ++task)
+        check(serialStatus[task*8]==0,"Stage3 baseline incomplete");
+    auto expectedPacked=packed.Download();
+    auto expectedScales=scales.Download();
+    auto expectedLse=lse.Download();
+
+    std::vector<uint32_t> blockCounts{1};
+    for (uint32_t blocks: {2u,5u,maxBlocks})
+        if (blocks<=maxBlocks && std::find(blockCounts.begin(),blockCounts.end(),blocks)==blockCounts.end())
+            blockCounts.push_back(blocks);
+    for (uint32_t blocks:blockCounts) {
+      std::vector<uint8_t> vectorPacked;
+      std::vector<uint32_t> vectorScales;
+      std::vector<float> vectorLse;
+      for (Stage4Mode mode: {Stage4Mode::Reference,Stage4Mode::Vector,Stage4Mode::Pipeline}) {
+        packed.Upload(std::vector<uint8_t>(packed.count,0xa5));
+        scales.Upload(std::vector<uint32_t>(scales.count,0xa5a5a5a5u));
+        lse.Upload(std::vector<float>(lse.count,NAN));
+        status.Upload(std::vector<int32_t>(status.count,-1));
+        std::fprintf(stderr,"NPU stage4 [%s]: tasks=%u groups=%u mode=%d\n",name,taskCount,blocks,int(mode));
+        launch_mega_attn_stage4(in,scratch,online,c.use_sink?sink.data:nullptr,final,taskCount,blocks,
+                              configs.data,qkTiling,pvTiling,workspace,rt.stream,mode);
+        auto sync=aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
+        if (sync!=ACL_SUCCESS) std::fprintf(stderr,"NPU stage4 sync failed: %d\n",int(sync));
+        AclCheck(sync,"stage4 synchronize");
+        auto gotStatus=status.Download();
+        if (gotStatus[0]==int(Step::ProcessTasks))
+            throw std::runtime_error("TODO stage4: ProcessTasks/BindTask");
+        for (uint32_t task=0; task<taskCount; ++task) {
+            if (gotStatus[task*8]!=0)
+                throw std::runtime_error("Stage4 task "+std::to_string(task)+": "+StepName(gotStatus[task*8]));
+        }
+        auto actualPacked=packed.Download();
+        auto actualScales=scales.Download();
+        auto actualLse=lse.Download();
+        if (mode==Stage4Mode::Reference) {
+            check(actualPacked==expectedPacked,"Multi-core FP8 differs from serial baseline");
+            check(actualScales==expectedScales,"Multi-core scale/padding differs from serial baseline");
+            CompareFloats(actualLse,expectedLse,0,0,"Multi-core LSE");
+        } else {
+            CompareQuantized(c,ref,actualPacked,actualScales,actualLse);
+            if (mode==Stage4Mode::Vector) {
+                vectorPacked=actualPacked; vectorScales=actualScales; vectorLse=actualLse;
+            } else {
+                check(actualPacked==vectorPacked && actualScales==vectorScales,"Prefetch changed output bytes");
+                CompareFloats(actualLse,vectorLse,0,0,"Prefetch LSE");
+            }
+        }
+        qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard(); prob.CheckGuard();
+        valid.CheckGuard(); scores.CheckGuard(); pv.CheckGuard(); output.CheckGuard();
+        rowMax.CheckGuard(); rowSum.CheckGuard(); status.CheckGuard();
+        packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
+        std::printf("PASS NPU stage4: %s tasks=%u blocks=%u mode=%d\n",name,taskCount,blocks,int(mode));
+      }
+    }
+    if (benchmark) {
+        std::printf("BENCH shape: N=%d heads=%d dim=%d FP8_K=%d FP4_K=%d groups=%u\n",
+                    c.n,HEADS,DIM,c.k,c.ek,maxBlocks);
+        MeasureBatch(rt,"serial-stage3",c.n,[&] {
+            for (uint32_t task=0; task<taskCount; ++task) {
+                auto one=scratch; one.status=status.data+task*8;
+                launch_mega_attn_stage3(in,one,online,c.use_sink?sink.data:nullptr,final,
+                                      configs.data+task,qkTiling,pvTiling,workspace,rt.stream);
+            }
+        });
+        auto measure=[&](const char *label,Stage4Mode mode,uint32_t blocks) {
+            MeasureBatch(rt,label,c.n,[&] {
+                launch_mega_attn_stage4(in,scratch,online,c.use_sink?sink.data:nullptr,final,taskCount,blocks,
+                                      configs.data,qkTiling,pvTiling,workspace,rt.stream,mode);
+            });
+            CompareQuantized(c,ref,packed.Download(),scales.Download(),lse.Download());
+            auto done=status.Download();
+            for (uint32_t task=0; task<taskCount; ++task) check(done[task*8]==0,"Timed task incomplete");
+        };
+        measure("parallel-reference",Stage4Mode::Reference,maxBlocks);
+        measure("vector-sync",Stage4Mode::Vector,maxBlocks);
+        measure("pipeline-1group",Stage4Mode::Pipeline,1);
+        measure("pipeline",Stage4Mode::Pipeline,maxBlocks);
+    }
+    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
+    rope.CheckGuard(); sink.CheckGuard(); configs.CheckGuard();
+    qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard(); prob.CheckGuard();
+    valid.CheckGuard(); scores.CheckGuard(); pv.CheckGuard(); output.CheckGuard();
+    rowMax.CheckGuard(); rowSum.CheckGuard(); status.CheckGuard();
+    packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
+}
+
+
+void MultiCoreNpuTests(Runtime &rt, uint32_t availableCores,
+                       void *qkTiling, void *pvTiling, void *workspace) {
+    auto run=[&](const char *name,const mega_test::Case &c,bool bench=false) {
+        RunStage4Case(rt,name,c,availableCores,qkTiling,pvTiling,workspace,bench);
+    };
+    mega_test::Case mixed(3,72,121,65,17);
+    run("mixed/tail/empty",mixed);
+    mixed.lengths[2]=0; mixed.use_sink=false;
+    run("empty prefix + null sink",mixed);
+    mixed.lengths[2]=mixed.k; mixed.extra_lengths[2]=0;
+    run("empty suffix",mixed);
+    mega_test::Case small(1,8,9,5);
+    for (int h=0; h<HEADS; ++h) {
+        const float sinks[4]={INFINITY,-INFINITY,10000.0f,-10000.0f};
+        small.sink[h]=sinks[h%4];
+    }
+    run("finite/infinite sinks",small);
+    small.main.pack(std::vector<float>(small.main.decoded.size(),0));
+    small.extra.pack(std::vector<float>(small.extra.decoded.size(),0));
+    run("single tile + zero output",small);
+    mega_test::Case rising(1,128,65,5);
+    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
+    rising.main.pack(std::vector<float>(rising.main.decoded.size(),.5f));
+    rising.extra.pack(std::vector<float>(rising.extra.decoded.size(),.75f));
+    run("rising maximum + large scores",rising);
+    mega_test::Case throughput(8,128,65,65,17);
+    std::fill(throughput.lengths.begin(),throughput.lengths.end(),throughput.k);
+    std::fill(throughput.extra_lengths.begin(),throughput.extra_lengths.end(),throughput.ek);
+    run("full batch",throughput,true);
+}
+
 void NpuTests() {
     Runtime rt;
     std::fprintf(stderr, "NPU: query platform\n");
@@ -417,6 +808,10 @@ void NpuTests() {
     run("maximum rises in later tile",rising,0,0);
     std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
     run("large positive scores",rising,0,0);
+    std::puts("PASS: stage 2 regression (9 cases)");
+    FinalNpuTests(rt,qkTiling.data,pvTiling.data,workspace.data);
+    std::puts("PASS: stage 3 complete output (sink/LSE/inverse RoPE/FP8)");
+    MultiCoreNpuTests(rt,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,workspace.data);
     qkTiling.CheckGuard(); pvTiling.CheckGuard();
     tiling.CheckGuard(); workspace.CheckGuard();
 }
@@ -427,11 +822,12 @@ int main() {
     try {
         OracleTests();
         OnlineOracleTests();
+        FinalOracleTests();
 #ifdef MEGA_ASCEND_CPU_ONLY
-        std::puts("CPU oracle only: NPU compilation/execution NOT tested; learner TODOs remain.");
+        std::puts("CPU oracle only: device execution NOT tested; run the NPU build for stage 1-4 and benchmarks.");
 #else
         NpuTests();
-        std::puts("PASS: stage 2 online attention (sink/inverse RoPE/quantization remain)");
+        std::puts("PASS: stage 4 vector/pipeline correctness and benchmark complete");
 #endif
         return 0;
     } catch (const std::exception &e) {

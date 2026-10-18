@@ -2,10 +2,10 @@
 #include <cstdint>
 
 namespace mega_ascend {
-// 学习进度：1 单块 QK（已完成）；2 online attention（作业进行中）；3 完整输出；4 流水优化。
-// 固定环境：910B2C / CANN 9.0.0；2026-10-17 阶段 1 的 CPU + 8 组 NPU 对拍通过。
-// 阶段 2：单 query、16 个 head、全部 KV tile；五个新函数由学习者填写，不自动提交 Git。
-// 骨架的 CPU oracle 与 AIC/AIV 编译检查已过；NPU TODO 基线待租卡环境恢复后验证。
+// 阶段 1/2 已实卡验证；阶段 3/4 实现完整，尚待实卡验收。
+// 目标：910B2C / CANN 9.0.0；阶段 4 包含多核、向量化、KV 预取和计时对比。
+// 本地 AIC/AIV 编译、CPU oracle 和实际函数的 CPU 数值模拟通过；不代表 NPU 验收。
+// run.sh 回归阶段 1~4，再输出完整 batch 延迟和 query/s。
 constexpr int HEADS = 64, DIM = 512, ROPE_DIM = 64;
 constexpr int HEAD_TILE = 16, KV_TILE = 64;
 constexpr float SCORE_SCALE = 0.04419417382415922f; // 1 / sqrt(512)
@@ -29,7 +29,9 @@ enum class Step : int32_t {
     Done = 0, LoadQuery = 1, ApplyQueryRope = 2, LoadKvTile = 3,
     DecodeKvTile = 4, ComputeQk = 5, MaskScores = 6,
     InitOnlineState = 10, OnlineSoftmax = 11, ComputePv = 12,
-    AccumulateOutput = 13, NormalizeOutput = 14
+    AccumulateOutput = 13, NormalizeOutput = 14,
+    ApplySinkAndLse = 20, ApplyOutputRope = 21, QuantizeOutput = 22,
+    ProcessTasks = 30
 };
 inline const char *StepName(int32_t step) {
     switch (static_cast<Step>(step)) {
@@ -45,6 +47,10 @@ inline const char *StepName(int32_t step) {
         case Step::ComputePv: return "ComputePv";
         case Step::AccumulateOutput: return "AccumulateOutput";
         case Step::NormalizeOutput: return "NormalizeOutput";
+        case Step::ApplySinkAndLse: return "ApplySinkAndLse";
+        case Step::ApplyOutputRope: return "ApplyOutputRope";
+        case Step::QuantizeOutput: return "QuantizeOutput";
+        case Step::ProcessTasks: return "ProcessTasks/BindTask";
         default: return "invalid/missing device status";
     }
 }
