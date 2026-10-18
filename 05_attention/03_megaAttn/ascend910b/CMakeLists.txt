@@ -10,7 +10,7 @@ target_compile_options(bench_megaAttn PRIVATE -O2 -Wall -Wextra)
 if(MEGA_ASCEND_CPU_ONLY)
     target_compile_definitions(bench_megaAttn PRIVATE MEGA_ASCEND_CPU_ONLY)
     enable_testing()
-    add_test(NAME stage1_cpu_oracle COMMAND bench_megaAttn)
+    add_test(NAME mega_attn_cpu_oracle COMMAND bench_megaAttn)
     return()
 endif()
 
@@ -35,7 +35,7 @@ if(NOT ASCENDC_CMAKE_DIR)
     message(FATAL_ERROR "Cannot find ascendc.cmake under ${ASCEND_CANN_PACKAGE_PATH}; check Toolkit installation")
 endif()
 include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
-ascendc_library(mega_attn_kernel STATIC megaAttn_v0.cpp)
+ascendc_library(mega_attn_kernel STATIC megaAttn_v1.cpp)
 # 让启动封装初始化 Matmul 通信区并通知 AIV；workspace 必须是核函数最后一个参数。
 ascendc_compile_definitions(mega_attn_kernel PRIVATE HAVE_WORKSPACE)
 target_include_directories(bench_megaAttn PRIVATE

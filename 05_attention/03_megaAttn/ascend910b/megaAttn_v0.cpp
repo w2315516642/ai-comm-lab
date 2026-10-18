@@ -413,13 +413,12 @@ class KernelMegaStage1 {
     TBuf<TPosition::VECCALC> qBuf, rawBuf, kvBuf, validBuf, scoreBuf, statusBuf;
 };
 
-extern "C" __global__ __aicore__ void mega_attn_stage1(
+__aicore__ inline void RunStage1(
     GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
     GM_ADDR rope, GM_ADDR config, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
     GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR cube_tiling,
     GM_ADDR workspace
 ) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
     TPipe pipe;
     KernelMegaStage1 op;
     TCubeTiling tiling;
@@ -435,19 +434,6 @@ extern "C" __global__ __aicore__ void mega_attn_stage1(
         scores, status, &pipe
     );
     op.Process();
-}
-
-extern "C" void launch_mega_attn_stage1(
-    const Stage1Input &in, const Stage1Output &out, void *config,
-    void *cube_tiling, void *workspace, void *stream
-) {
-    mega_attn_stage1<<<1, nullptr, stream>>>(
-        (GM_ADDR)in.q, (GM_ADDR)in.kv_fp8, (GM_ADDR)in.kv_fp4,
-        (GM_ADDR)in.indices, (GM_ADDR)in.extra_indices, (GM_ADDR)in.cos_sin,
-        (GM_ADDR)config, (GM_ADDR)out.q_loaded, (GM_ADDR)out.q_rope,
-        (GM_ADDR)out.kv, (GM_ADDR)out.valid, (GM_ADDR)out.scores,
-        (GM_ADDR)out.status, (GM_ADDR)cube_tiling, (GM_ADDR)workspace
-    );
 }
 
 // 阶段 2 复用阶段 1 的搬运/QK，只增加跨 KV tile 的 softmax 与 PV 累加。
@@ -698,14 +684,13 @@ class KernelMegaStage2 : public KernelMegaStage1 {
     TBuf<TPosition::VECCALC> pBuf, accBuf, maxBuf, sumBuf, alphaBuf;
 };
 
-extern "C" __global__ __aicore__ void mega_attn_stage2(
+__aicore__ inline void RunStage2(
     GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
     GM_ADDR rope, GM_ADDR config, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
     GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR p, GM_ADDR pv,
     GM_ADDR output, GM_ADDR row_max, GM_ADDR row_sum, GM_ADDR qk_tiling,
     GM_ADDR pv_tiling, GM_ADDR workspace
 ) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
     TPipe pipe;
     KernelMegaStage2 op;
     TCubeTiling qkTiling, pvTiling;
@@ -726,22 +711,6 @@ extern "C" __global__ __aicore__ void mega_attn_stage2(
     );
     op.InitOnline(p, pv, output, row_max, row_sum, &pipe);
     op.ProcessOnline();
-}
-
-extern "C" void launch_mega_attn_stage2(
-    const Stage1Input &in, const Stage1Output &scratch, const Stage2Output &out,
-    void *config, void *qk_tiling, void *pv_tiling, void *workspace,
-    void *stream
-) {
-    mega_attn_stage2<<<1, nullptr, stream>>>(
-        (GM_ADDR)in.q, (GM_ADDR)in.kv_fp8, (GM_ADDR)in.kv_fp4,
-        (GM_ADDR)in.indices, (GM_ADDR)in.extra_indices, (GM_ADDR)in.cos_sin,
-        (GM_ADDR)config, (GM_ADDR)scratch.q_loaded, (GM_ADDR)scratch.q_rope,
-        (GM_ADDR)scratch.kv, (GM_ADDR)scratch.valid, (GM_ADDR)scratch.scores,
-        (GM_ADDR)scratch.status, (GM_ADDR)out.p, (GM_ADDR)out.pv,
-        (GM_ADDR)out.output, (GM_ADDR)out.row_max, (GM_ADDR)out.row_sum,
-        (GM_ADDR)qk_tiling, (GM_ADDR)pv_tiling, (GM_ADDR)workspace
-    );
 }
 
 // 完整输出阶段复用 online 状态；不新增 UB，alpha/score/raw 在末尾可作临时缓冲。
@@ -1019,7 +988,7 @@ class KernelMegaStage3 : public KernelMegaStage2 {
     GlobalTensor<uint32_t> scalesGm;
 };
 
-extern "C" __global__ __aicore__ void mega_attn_stage3(
+__aicore__ inline void RunStage3(
     GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
     GM_ADDR rope, GM_ADDR config, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
     GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR p, GM_ADDR pv,
@@ -1027,7 +996,6 @@ extern "C" __global__ __aicore__ void mega_attn_stage3(
     GM_ADDR scales, GM_ADDR lse, int32_t sf_stride, GM_ADDR qk_tiling,
     GM_ADDR pv_tiling, GM_ADDR workspace
 ) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
     TPipe pipe;
     KernelMegaStage3 op;
     TCubeTiling qkTiling, pvTiling;
@@ -1049,25 +1017,6 @@ extern "C" __global__ __aicore__ void mega_attn_stage3(
     op.InitOnline(p, pv, output, row_max, row_sum, &pipe);
     op.InitFinal(sink, fp8, scales, lse, sf_stride);
     op.ProcessFinal();
-}
-
-extern "C" void launch_mega_attn_stage3(
-    const Stage1Input &in, const Stage1Output &scratch,
-    const Stage2Output &online, const float *sink, const Stage3Output &out,
-    void *config, void *qk_tiling, void *pv_tiling, void *workspace,
-    void *stream
-) {
-    mega_attn_stage3<<<1, nullptr, stream>>>(
-        (GM_ADDR)in.q, (GM_ADDR)in.kv_fp8, (GM_ADDR)in.kv_fp4,
-        (GM_ADDR)in.indices, (GM_ADDR)in.extra_indices, (GM_ADDR)in.cos_sin,
-        (GM_ADDR)config, (GM_ADDR)scratch.q_loaded, (GM_ADDR)scratch.q_rope,
-        (GM_ADDR)scratch.kv, (GM_ADDR)scratch.valid, (GM_ADDR)scratch.scores,
-        (GM_ADDR)scratch.status, (GM_ADDR)online.p, (GM_ADDR)online.pv,
-        (GM_ADDR)online.output, (GM_ADDR)online.row_max,
-        (GM_ADDR)online.row_sum, (GM_ADDR)sink, (GM_ADDR)out.fp8,
-        (GM_ADDR)out.scales, (GM_ADDR)out.lse, out.sf_stride,
-        (GM_ADDR)qk_tiling, (GM_ADDR)pv_tiling, (GM_ADDR)workspace
-    );
 }
 
 // 每个 AIC/AIV 组复用一份 UB 和 GM 暂存，顺序完成分配给自己的完整 attention
@@ -1308,7 +1257,7 @@ class KernelMegaStage4 : public KernelMegaStage3 {
     int32_t finalSfStride;
 };
 
-extern "C" __global__ __aicore__ void mega_attn_stage4(
+__aicore__ inline void RunStage4(
     GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
     GM_ADDR rope, GM_ADDR configs, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
     GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR p, GM_ADDR pv,
@@ -1316,7 +1265,6 @@ extern "C" __global__ __aicore__ void mega_attn_stage4(
     GM_ADDR scales, GM_ADDR lse, int32_t sf_stride, uint32_t task_count, int32_t mode,
     GM_ADDR qk_tiling, GM_ADDR pv_tiling, GM_ADDR workspace
 ) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
     TPipe pipe;
     KernelMegaStage4 op;
     TCubeTiling qkTiling, pvTiling;
@@ -1351,13 +1299,60 @@ extern "C" __global__ __aicore__ void mega_attn_stage4(
     op.RunTasks();
 }
 
-extern "C" void launch_mega_attn_stage4(
-    const Stage1Input &in, const Stage1Output &scratch,
+// CANN 9.0.0 的多入口生成器可能写错混合核元数据编号；统一设备入口避免该问题。
+// stage 在一次 launch 中对 AIC/AIV 相同，四个阶段的计算仍由独立函数负责。
+extern "C" __global__ __aicore__ void mega_attn_dispatch(
+    GM_ADDR q, GM_ADDR kv8, GM_ADDR kv4, GM_ADDR ids, GM_ADDR extra_ids,
+    GM_ADDR rope, GM_ADDR configs, GM_ADDR q_loaded, GM_ADDR q_rope, GM_ADDR kv,
+    GM_ADDR valid, GM_ADDR scores, GM_ADDR status, GM_ADDR p, GM_ADDR pv,
+    GM_ADDR output, GM_ADDR row_max, GM_ADDR row_sum, GM_ADDR sink, GM_ADDR fp8,
+    GM_ADDR scales, GM_ADDR lse, int32_t sf_stride, uint32_t task_count, int32_t mode, int32_t stage,
+    GM_ADDR qk_tiling, GM_ADDR pv_tiling, GM_ADDR workspace
+) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+    if (stage == 1) {
+        RunStage1(
+            q, kv8, kv4, ids, extra_ids, rope,
+            configs, q_loaded, q_rope, kv, valid, scores,
+            status, qk_tiling, workspace
+        );
+    }
+    else if (stage == 2) {
+        RunStage2(
+            q, kv8, kv4, ids, extra_ids, rope,
+            configs, q_loaded, q_rope, kv, valid, scores,
+            status, p, pv, output, row_max, row_sum,
+            qk_tiling, pv_tiling, workspace
+        );
+    }
+    else if (stage == 3) {
+        RunStage3(
+            q, kv8, kv4, ids, extra_ids, rope,
+            configs, q_loaded, q_rope, kv, valid, scores,
+            status, p, pv, output, row_max, row_sum,
+            sink, fp8, scales, lse, sf_stride, qk_tiling,
+            pv_tiling, workspace
+        );
+    }
+    else if (stage == 4) {
+        RunStage4(
+            q, kv8, kv4, ids, extra_ids, rope,
+            configs, q_loaded, q_rope, kv, valid, scores,
+            status, p, pv, output, row_max, row_sum,
+            sink, fp8, scales, lse, sf_stride, task_count,
+            mode, qk_tiling, pv_tiling, workspace
+        );
+    }
+}
+
+// Host 接口只补齐各阶段未使用的参数；workspace 始终放在设备入口的最后。
+static void LaunchMega(
+    int32_t stage, const Stage1Input &in, const Stage1Output &scratch,
     const Stage2Output &online, const float *sink, const Stage3Output &out,
     uint32_t task_count, uint32_t block_num, void *configs, void *qk_tiling,
     void *pv_tiling, void *workspace, void *stream, Stage4Mode mode
 ) {
-    mega_attn_stage4<<<block_num, nullptr, stream>>>(
+    mega_attn_dispatch<<<block_num, nullptr, stream>>>(
         (GM_ADDR)in.q, (GM_ADDR)in.kv_fp8, (GM_ADDR)in.kv_fp4,
         (GM_ADDR)in.indices, (GM_ADDR)in.extra_indices, (GM_ADDR)in.cos_sin,
         (GM_ADDR)configs, (GM_ADDR)scratch.q_loaded, (GM_ADDR)scratch.q_rope,
@@ -1365,7 +1360,45 @@ extern "C" void launch_mega_attn_stage4(
         (GM_ADDR)scratch.status, (GM_ADDR)online.p, (GM_ADDR)online.pv,
         (GM_ADDR)online.output, (GM_ADDR)online.row_max,
         (GM_ADDR)online.row_sum, (GM_ADDR)sink, (GM_ADDR)out.fp8,
-        (GM_ADDR)out.scales, (GM_ADDR)out.lse, out.sf_stride, task_count, static_cast<int32_t>(mode),
+        (GM_ADDR)out.scales, (GM_ADDR)out.lse, out.sf_stride, task_count,
+        static_cast<int32_t>(mode), stage,
         (GM_ADDR)qk_tiling, (GM_ADDR)pv_tiling, (GM_ADDR)workspace
     );
+}
+
+extern "C" void launch_mega_attn_stage1(
+    const Stage1Input &in, const Stage1Output &out, void *config,
+    void *cube_tiling, void *workspace, void *stream
+) {
+    LaunchMega(1, in, out, {}, nullptr, {}, 1, 1, config, cube_tiling,
+               nullptr, workspace, stream, Stage4Mode::Reference);
+}
+
+extern "C" void launch_mega_attn_stage2(
+    const Stage1Input &in, const Stage1Output &scratch, const Stage2Output &out,
+    void *config, void *qk_tiling, void *pv_tiling, void *workspace,
+    void *stream
+) {
+    LaunchMega(2, in, scratch, out, nullptr, {}, 1, 1, config, qk_tiling,
+               pv_tiling, workspace, stream, Stage4Mode::Reference);
+}
+
+extern "C" void launch_mega_attn_stage3(
+    const Stage1Input &in, const Stage1Output &scratch,
+    const Stage2Output &online, const float *sink, const Stage3Output &out,
+    void *config, void *qk_tiling, void *pv_tiling, void *workspace,
+    void *stream
+) {
+    LaunchMega(3, in, scratch, online, sink, out, 1, 1, config, qk_tiling,
+               pv_tiling, workspace, stream, Stage4Mode::Reference);
+}
+
+extern "C" void launch_mega_attn_stage4(
+    const Stage1Input &in, const Stage1Output &scratch,
+    const Stage2Output &online, const float *sink, const Stage3Output &out,
+    uint32_t task_count, uint32_t block_num, void *configs, void *qk_tiling,
+    void *pv_tiling, void *workspace, void *stream, Stage4Mode mode
+) {
+    LaunchMega(4, in, scratch, online, sink, out, task_count, block_num,
+               configs, qk_tiling, pv_tiling, workspace, stream, mode);
 }

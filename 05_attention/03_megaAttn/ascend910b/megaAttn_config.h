@@ -2,10 +2,9 @@
 #include <cstdint>
 
 namespace mega_ascend {
-// 阶段 1/2 已实卡验证；阶段 3/4 实现完整，尚待实卡验收。
-// 目标：910B2C / CANN 9.0.0；阶段 4 包含多核、向量化、KV 预取和计时对比。
-// 本地 AIC/AIV 编译、CPU oracle 和实际函数的 CPU 数值模拟通过；不代表 NPU 验收。
-// run.sh 回归阶段 1~4，再输出完整 batch 延迟和 query/s。
+// 阶段 1~4 已在 910B2 / CANN 9.0.0 实卡验收：数值、布局、多核和预取对拍通过。
+// B2C 先前验证了阶段 1/2；完整新版的 B2C 实卡结果尚未补测。
+// run.sh 自动识别芯片，回归阶段 1~4，再输出完整 batch 延迟和 query/s。
 constexpr int HEADS = 64, DIM = 512, ROPE_DIM = 64;
 constexpr int HEAD_TILE = 16, KV_TILE = 64;
 constexpr float SCORE_SCALE = 0.04419417382415922f; // 1 / sqrt(512)

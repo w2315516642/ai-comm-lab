@@ -2,15 +2,20 @@
 #define MEGA_ATTN_REFERENCE_ONLY
 #include "../sm100/bench_megaAttn.cu"
 #undef MEGA_ATTN_REFERENCE_ONLY
-#include "megaAttn_api.h"
+#include "megaAttn_v1.h"
 #include <cstdio>
 #include <cstdlib>
 
-using namespace mega_ascend;
+using namespace mega_ascend_v1;
 using mega_test::check;
 
 namespace {
-// 每个阶段观测点的 CPU 预期值；Q/KV 保留 BF16 存储位，分数用 FP32。
+// CPU 参考逐块构造 QK，再收集全部 KV 做独立的完整 softmax。
+struct TileConfig : TaskConfig {
+    int32_t kv_begin = 0;
+};
+
+// CPU 单块参考值；不要求设备导出任何中间张量。
 struct Expected {
     std::vector<uint16_t> q = std::vector<uint16_t>(Q_ELEMS);
     std::vector<uint16_t> rope = std::vector<uint16_t>(Q_ELEMS);
@@ -20,16 +25,15 @@ struct Expected {
     std::vector<float> masked = std::vector<float>(SCORE_ELEMS, -INFINITY);
 };
 
-Stage1Config MakeConfig(const mega_test::Case &c, int q, int head, int begin) {
+TileConfig MakeConfig(const mega_test::Case &c, int q, int head, int begin) {
     check(q >= 0 && q < c.n && head >= 0 && head + HEAD_TILE <= HEADS &&
-          head % HEAD_TILE == 0 && begin >= 0 && begin < c.k + c.ek &&
-          begin % KV_TILE == 0, "Invalid stage-1 coordinates");
-    return {q, head, begin, c.positions[q], c.k, c.ek, c.lengths[q], c.extra_lengths[q],
-            c.main.size, c.main.pages, c.main.stride, c.extra.size, c.extra.pages,
-            c.extra.stride, c.istride, c.eistride};
+          head % HEAD_TILE == 0 && begin >= 0 &&
+          begin % KV_TILE == 0, "Invalid tile coordinates");
+    return {{q, head, c.positions[q], c.k, c.ek, c.lengths[q], c.extra_lengths[q],
+             c.main.size, c.main.stride, c.extra.size, c.extra.stride, c.istride, c.eistride}, begin};
 }
 
-Expected ReferenceTile(const mega_test::Case &c, const Stage1Config &p) {
+Expected ReferenceTile(const mega_test::Case &c, const TileConfig &p) {
     Expected r;
     for (int h = 0; h < HEAD_TILE; ++h) {
         for (int d = 0; d < DIM; ++d)
@@ -116,7 +120,7 @@ struct OnlineExpected {
     std::vector<float> row_max = std::vector<float>(HEAD_TILE, -INFINITY);
     std::vector<float> row_sum = std::vector<float>(HEAD_TILE, 0);
 };
-OnlineExpected ReferenceOnline(const mega_test::Case &c, Stage1Config p) {
+OnlineExpected ReferenceOnline(const mega_test::Case &c, TileConfig p) {
     std::vector<Expected> tiles;
     for (p.kv_begin = 0; p.kv_begin < p.topk + p.extra_topk; p.kv_begin += KV_TILE)
         tiles.push_back(ReferenceTile(c, p));
@@ -170,7 +174,7 @@ void OnlineOracleTests() {
     double out = (.5*c.k*a+.75*c.ek)/sum;
     for (float x : rising.output) check(std::abs(x-out)<1e-6, "Rising max output");
     for (float x : rising.row_sum) check(std::abs(x-sum)<2e-5, "Rising max sum");
-    std::puts("PASS CPU: stage-2 full softmax oracle, empty/uniform/rising-max");
+    std::puts("PASS CPU: full softmax oracle, empty/uniform/rising-max");
 }
 
 
@@ -178,7 +182,7 @@ void OnlineOracleTests() {
 struct FinalExpected {
     std::vector<float> output, lse;
 };
-FinalExpected ReferenceFinal(const mega_test::Case &c, const Stage1Config &p, bool rotate) {
+FinalExpected ReferenceFinal(const mega_test::Case &c, const TileConfig &p, bool rotate) {
     auto online = ReferenceOnline(c,p);
     FinalExpected r{online.output,std::vector<float>(HEAD_TILE,INFINITY)};
     for (int h=0; h<HEAD_TILE; ++h) {
@@ -268,7 +272,7 @@ void FinalOracleTests() {
     std::fill(input.begin(),input.end(),0);
     PackFinalTile(input,0,0,c.sfstride,data,scales);
     check(scales[0]==0x69696969u,"Zero amax scale must be 2^-22 (UE8M0=105)");
-    std::puts("PASS CPU: stage-3 sink/LSE, inverse RoPE, FP8/UE8M0 and output layouts");
+    std::puts("PASS CPU: sink/LSE, inverse RoPE, FP8/UE8M0 and output layouts");
 }
 
 void OracleTests() {
@@ -301,8 +305,45 @@ void OracleTests() {
     ExpectFailure([&]{ CompareFloats(bad_scores, known.masked, 1e-3f, 1e-3f, "score"); }, "Score checker");
     auto bad_mask = empty.masked; bad_mask[0] = 0;
     ExpectFailure([&]{ CompareFloats(bad_mask, empty.masked, 0, 0, "mask"); }, "Mask checker");
-    std::puts("PASS CPU: codecs, stage-1 Q/KV layouts, mixed/tail/empty tiles and QK oracle");
+    std::puts("PASS CPU: codecs, Q/KV layouts, mixed/tail/empty tiles and QK oracle");
 }
+template<class F> void ForEachCase(F run) {
+    mega_test::Case mixed(3,72,121,65,17);
+    run("mixed/tail/empty",mixed);
+    mixed.lengths[2]=0; mixed.use_sink=false;
+    run("empty prefix + null sink",mixed);
+    mixed.lengths[2]=mixed.k; mixed.extra_lengths[2]=0;
+    run("empty suffix",mixed);
+    mega_test::Case small(1,8,9,5);
+    for (int h=0; h<HEADS; ++h) {
+        const float sinks[4]={INFINITY,-INFINITY,10000.0f,-10000.0f};
+        small.sink[h]=sinks[h%4];
+    }
+    run("finite/infinite sinks",small);
+    small.main.pack(std::vector<float>(small.main.decoded.size(),0));
+    small.extra.pack(std::vector<float>(small.extra.decoded.size(),0));
+    run("single tile + zero output",small);
+    mega_test::Case rising(1,128,65,5);
+    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
+    rising.main.pack(std::vector<float>(rising.main.decoded.size(),.5f));
+    rising.extra.pack(std::vector<float>(rising.extra.decoded.size(),.75f));
+    run("rising maximum + large scores",rising);
+    // 生成器沿用 CUDA 的非空容量限制；生成后收缩逻辑容量，保留合法分配。
+    mega_test::Case noKv(1,8,9,5);
+    noKv.k=0; noKv.ek=0; noKv.lengths[0]=0; noKv.extra_lengths[0]=0;
+    run("zero KV capacity",noKv);
+    mega_test::Case fp8Only(1,72,9,5);
+    fp8Only.ek=0; fp8Only.extra_lengths[0]=0;
+    run("FP8 only",fp8Only);
+    mega_test::Case fp4Only(1,8,65,5);
+    fp4Only.k=0; fp4Only.lengths[0]=0;
+    run("FP4 only",fp4Only);
+    mega_test::Case throughput(8,128,65,65,17);
+    std::fill(throughput.lengths.begin(),throughput.lengths.end(),throughput.k);
+    std::fill(throughput.extra_lengths.begin(),throughput.extra_lengths.end(),throughput.ek);
+    run("full batch",throughput,true);
+}
+
 } // namespace
 
 #ifndef MEGA_ASCEND_CPU_ONLY
@@ -368,8 +409,8 @@ template<class T> struct DeviceBuffer {
     }
 };
 
-// 在 Host 生成固定 QK 的 tiling；GM 输入输出让阶段 1 的观测点可直接复用。
-std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, int ubBytes = 64*1024) {
+// 固定 QK/PV 形状的 Matmul tiling，与 kernel 内的 GM 暂存布局一致。
+std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, int ubBytes = 16*1024) {
     using namespace matmul_tiling;
     MatmulApiTiling api(platform);
     api.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_BF16, false);
@@ -379,7 +420,7 @@ std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform,
     int n = pv ? DIM : KV_TILE, k = pv ? KV_TILE : DIM;
     api.SetShape(HEAD_TILE, n, k);
     api.SetOrgShape(HEAD_TILE, n, k);
-    // 剩余 UB 留给约 118 KiB 的用户缓冲；不要默认把全部 UB 交给 Matmul。
+    // 用户缓冲约 153 KiB；QK/PV 各限 16 KiB，总量不超过 192 KiB UB。
     api.SetBufferSpace(-1, -1, ubBytes);
     optiling::TCubeTiling tiling;
     check(api.GetTiling(tiling) != -1, "QK tiling failed");
@@ -387,174 +428,6 @@ std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform,
     tiling.SaveToBuffer(bytes.data(), bytes.size());
     return bytes;
 }
-
-void RunCase(Runtime &rt, const char *name, const mega_test::Case &c,
-             const Stage1Config &p, void *tiling, void *workspace) {
-    std::fprintf(stderr, "NPU [%s]: prepare inputs\n", name);
-    auto ref = ReferenceTile(c,p);
-    DeviceBuffer<uint16_t> q(c.q), q_loaded(Q_ELEMS), q_rope(Q_ELEMS), kv(KV_ELEMS);
-    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes);
-    DeviceBuffer<int32_t> ids(c.indices), extra_ids(c.extra_indices), valid(KV_TILE);
-    DeviceBuffer<float> rope(c.cos_sin), scores(SCORE_ELEMS);
-    DeviceBuffer<int32_t> status(std::vector<int32_t>(8,-1));
-    DeviceBuffer<Stage1Config> config(std::vector<Stage1Config>{p});
-    Stage1Input in{q.data,main.data,extra.data,ids.data,extra_ids.data,rope.data};
-    Stage1Output out{q_loaded.data,q_rope.data,kv.data,valid.data,scores.data,status.data};
-    std::fprintf(stderr, "NPU [%s]: launch kernel\n", name);
-    launch_mega_attn_stage1(in,out,config.data,tiling,workspace,rt.stream);
-    std::fprintf(stderr, "NPU [%s]: wait kernel (30 s timeout)\n", name);
-    aclError syncStatus = aclrtSynchronizeStreamWithTimeout(rt.stream, 30000);
-    // 先输出错误，再清理资源，避免清理也阻塞时丢失定位信息。
-    if (syncStatus != ACL_SUCCESS)
-        std::fprintf(stderr, "NPU [%s]: synchronize failed, code=%d\n", name, int(syncStatus));
-    AclCheck(syncStatus, "kernel synchronize");
-    std::fprintf(stderr, "NPU [%s]: kernel complete, checking outputs\n", name);
-    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard();
-    extra_ids.CheckGuard(); rope.CheckGuard(); config.CheckGuard();
-    q_loaded.CheckGuard(); q_rope.CheckGuard(); kv.CheckGuard(); valid.CheckGuard();
-    scores.CheckGuard(); status.CheckGuard();
-    int step = status.Download()[0];
-    check(step >= 0 && step <= 6, "Missing/invalid device completion status");
-    int completed = step == 0 ? 6 : step-1;
-    if (completed >= 1) CompareBf16(q_loaded.Download(),ref.q,true,"LoadQuery");
-    if (completed >= 2) CompareBf16(q_rope.Download(),ref.rope,false,"RoPE");
-    if (completed >= 3) check(valid.Download() == ref.valid,"KV valid mask mismatch");
-    if (completed >= 4) CompareBf16(kv.Download(),ref.kv,true,"KV decode");
-    // QK 分数使用独立 CPU RoPE 结果，容纳一次 BF16 舍入差异的传播。
-    if (completed >= 5) CompareFloats(scores.Download(), step == 6 ? ref.raw : ref.masked,
-                                     step == 6 ? .03f : .0015f, .01f, "QK scores");
-    std::printf("%s: verified %d/6 steps\n",name,completed);
-    if (step != 0) throw std::runtime_error(std::string("TODO stage1: ")+StepName(step));
-    std::printf("PASS NPU stage1: %s\n",name);
-}
-
-
-void RunOnlineCase(Runtime &rt, const char *name, const mega_test::Case &c,
-                   const Stage1Config &p, void *qkTiling, void *pvTiling, void *workspace) {
-    auto ref = ReferenceOnline(c,p);
-    DeviceBuffer<uint16_t> q(c.q), qLoaded(Q_ELEMS), qRope(Q_ELEMS), kv(KV_ELEMS), prob(SCORE_ELEMS);
-    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes);
-    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(KV_TILE);
-    DeviceBuffer<float> rope(c.cos_sin), scores(SCORE_ELEMS), pv(Q_ELEMS), output(Q_ELEMS);
-    DeviceBuffer<float> rowMax(HEAD_TILE), rowSum(HEAD_TILE);
-    DeviceBuffer<int32_t> status(std::vector<int32_t>(8,-1));
-    DeviceBuffer<Stage1Config> config(std::vector<Stage1Config>{p});
-    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
-    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
-    Stage2Output out{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
-    std::fprintf(stderr,"NPU stage2 [%s]: launch + wait (30 s timeout)\n",name);
-    launch_mega_attn_stage2(in,scratch,out,config.data,qkTiling,pvTiling,workspace,rt.stream);
-    auto sync = aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
-    if (sync != ACL_SUCCESS) std::fprintf(stderr,"NPU stage2 synchronize failed: %d\n",int(sync));
-    AclCheck(sync,"stage2 synchronize");
-    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
-    rope.CheckGuard(); config.CheckGuard(); qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard();
-    valid.CheckGuard(); scores.CheckGuard(); status.CheckGuard(); prob.CheckGuard(); pv.CheckGuard();
-    output.CheckGuard(); rowMax.CheckGuard(); rowSum.CheckGuard();
-    int step = status.Download()[0];
-    check(step==0 || (step>=1 && step<=6) || (step>=10 && step<=14), "Stage2 completion status");
-    if (step==int(Step::OnlineSoftmax)) {
-        // 此时第一块的 softmax 尚未实现，导出的状态应仍为初始化值。
-        CompareFloats(rowMax.Download(),std::vector<float>(HEAD_TILE,-INFINITY),0,0,"Initial max");
-        CompareFloats(rowSum.Download(),std::vector<float>(HEAD_TILE,0),0,0,"Initial sum");
-        CompareFloats(output.Download(),std::vector<float>(Q_ELEMS,0),0,0,"Initial accumulator");
-        std::puts("PASS NPU: InitOnlineState");
-    }
-    if (step!=0) throw std::runtime_error(std::string("TODO stage2: ")+StepName(step));
-    // P 舍入为 BF16 后进入 Cube；参考用 FP64 softmax，容纳该舍入与 RoPE 误差。
-    CompareFloats(output.Download(),ref.output,.002f,.02f,"Online attention");
-    CompareFloats(rowMax.Download(),ref.row_max,.002f,.01f,"Online max");
-    CompareFloats(rowSum.Download(),ref.row_sum,.03f,.01f,"Online sum");
-    if (p.length==0 && p.extra_length==0)
-        CompareFloats(output.Download(),ref.output,0,0,"Empty attention");
-    std::printf("PASS NPU stage2: %s\n",name);
-}
-
-
-// 每个 query 的四个 head tile 串行复用 scratch；只验证语义，不在这里计吞吐。
-int RunFinalCase(Runtime &rt, const char *name, const mega_test::Case &c,
-                 void *qkTiling, void *pvTiling, void *workspace) {
-    DeviceBuffer<uint16_t> q(c.q), qLoaded(Q_ELEMS), qRope(Q_ELEMS), kv(KV_ELEMS), prob(SCORE_ELEMS);
-    DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes), packed(size_t(c.n)*HEADS*DIM);
-    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(KV_TILE);
-    DeviceBuffer<float> rope(c.cos_sin), sink(c.sink), scores(SCORE_ELEMS), pv(Q_ELEMS), output(Q_ELEMS);
-    DeviceBuffer<float> rowMax(HEAD_TILE), rowSum(HEAD_TILE), lse(size_t(c.n)*HEADS);
-    DeviceBuffer<uint32_t> scales(256*c.sfstride);
-    DeviceBuffer<int32_t> status(std::vector<int32_t>(8,-1));
-    DeviceBuffer<Stage1Config> config(1);
-    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
-    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
-    Stage2Output online{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
-    Stage3Output final{packed.data,scales.data,lse.data,c.sfstride};
-    std::vector<uint8_t> expectedPacked(packed.count,0xa5);
-    std::vector<uint32_t> expectedScales(scales.count,0xa5a5a5a5u);
-    std::vector<float> expectedLse(lse.count,INFINITY);
-    int stopped=-1;
-    std::fprintf(stderr,"NPU stage3 [%s]: %d query/head tiles\n",name,c.n*4);
-    for (int query=0; query<c.n; ++query) for (int head=0; head<HEADS; head+=HEAD_TILE) {
-        auto p=MakeConfig(c,query,head,0);
-        config.Upload({p}); status.Upload(std::vector<int32_t>(8,-1));
-        launch_mega_attn_stage3(in,scratch,online,c.use_sink?sink.data:nullptr,final,
-                              config.data,qkTiling,pvTiling,workspace,rt.stream);
-        auto sync=aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
-        if (sync!=ACL_SUCCESS) std::fprintf(stderr,"NPU stage3 [%s] q=%d h=%d: sync=%d\n",name,query,head,int(sync));
-        AclCheck(sync,"stage3 synchronize");
-        int step=status.Download()[0];
-        check(step==0 || (step>=20 && step<=22),"Stage3 status: earlier stage failed or no completion");
-        if (stopped<0) stopped=step;
-        check(step==stopped,"Inconsistent stage3 completion");
-        auto got=output.Download();
-        if (step==int(Step::ApplySinkAndLse)) {
-            CompareFloats(got,ReferenceOnline(c,p).output,.002f,.02f,"Stage3 online prerequisite");
-            continue;
-        }
-        auto ref=ReferenceFinal(c,p,step!=int(Step::ApplyOutputRope));
-        CompareFloats(got,ref.output,.003f,.03f,"Stage3 FP32 output");
-        std::copy(ref.lse.begin(),ref.lse.end(),expectedLse.begin()+query*HEADS+head);
-        if (p.length==0 && p.extra_length==0)
-            CompareFloats(got,std::vector<float>(Q_ELEMS,0),0,0,"Empty final output");
-        for (int h=0; h<HEAD_TILE; ++h) if (c.use_sink && c.sink[head+h]==INFINITY)
-            for (int d=0; d<DIM; ++d) check(got[h*DIM+d]==0,"Positive infinite sink must zero output");
-        if (step==0) PackFinalTile(got,query,head,c.sfstride,expectedPacked,expectedScales);
-    }
-    q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
-    rope.CheckGuard(); sink.CheckGuard(); config.CheckGuard(); qLoaded.CheckGuard(); qRope.CheckGuard();
-    kv.CheckGuard(); valid.CheckGuard(); scores.CheckGuard(); status.CheckGuard(); prob.CheckGuard();
-    pv.CheckGuard(); output.CheckGuard(); rowMax.CheckGuard(); rowSum.CheckGuard();
-    packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
-    if (stopped!=int(Step::ApplySinkAndLse))
-        CompareFloats(lse.Download(),expectedLse,.003f,.002f,"LSE (without sink)");
-    // TODO 时量化输出必须保持 poison；完成后逐字节检查，并检查 sf_stride 的 padding。
-    check(packed.Download()==expectedPacked,"FP8 bytes/layout mismatch");
-    check(scales.Download()==expectedScales,"UE8M0 scale/layout/padding mismatch");
-    std::printf("%s NPU stage3: %s%s%s\n",stopped==0?"PASS":"PARTIAL",name,
-                stopped==0?"":"; next TODO = ",stopped==0?"":StepName(stopped));
-    return stopped;
-}
-
-void FinalNpuTests(Runtime &rt, void *qkTiling, void *pvTiling, void *workspace) {
-    int missing=0;
-    auto run=[&](const char *name,const mega_test::Case &c) {
-        int step=RunFinalCase(rt,name,c,qkTiling,pvTiling,workspace);
-        if (step!=0) missing=step;
-    };
-    mega_test::Case mixed(3,72,121,65,17);
-    run("mixed/tail/empty + sink + nonzero RoPE",mixed);
-    mixed.use_sink=false;
-    run("null sink",mixed);
-    mega_test::Case extremes(1,8,9,5);
-    for (int h=0; h<HEADS; ++h) {
-        const float values[]={-INFINITY,INFINITY,-1000.f,1000.f};
-        extremes.sink[h]=values[h%4];
-    }
-    run("finite/infinite extreme sinks",extremes);
-    extremes.main.pack(std::vector<float>(extremes.main.decoded.size(),0));
-    extremes.extra.pack(std::vector<float>(extremes.extra.decoded.size(),0));
-    run("zero output quantization floor",extremes);
-    if (missing) throw std::runtime_error(std::string("TODO stage3: ")+StepName(missing));
-}
-
-
 
 // 输出量化会在舍入边界改变字节；按每组 amax/16 的 E4M3 半步误差检查数值。
 void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
@@ -568,10 +441,10 @@ void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
             float want=ref.out[base+j], value=got[base+j];
             float tolerance=.003f+.025f*std::abs(want)+amax/16;
             if (!std::isfinite(value) || std::abs(value-want)>tolerance)
-                throw std::runtime_error("Optimized quantized output mismatch at "+std::to_string(base+j));
+                throw std::runtime_error("v1 quantized output mismatch at "+std::to_string(base+j));
         }
     }
-    CompareFloats(lse,ref.lse,.003f,.002f,"Optimized LSE");
+    CompareFloats(lse,ref.lse,.003f,.002f,"v1 LSE");
     for (int q=0; q<c.n; ++q) for (int h=0; h<HEADS; ++h) {
         bool zero=(c.lengths[q]==0 && c.extra_lengths[q]==0) || (c.use_sink && c.sink[h]==INFINITY);
         if (zero) for (int d=0; d<DIM; ++d)
@@ -611,223 +484,102 @@ template<class F> void MeasureBatch(Runtime &rt,const char *name,int queries,F l
                 name,ms*1000,double(queries)*1000/ms,samples,repeats);
 }
 
-// 与阶段 3 的逐任务串行结果逐字节比较，检查任务遗漏、核间踩踏和 scale padding。
-void RunStage4Case(Runtime &rt, const char *name, const mega_test::Case &c, uint32_t availableCores,
-                   void *qkTiling, void *pvTiling, void *workspace, bool benchmark=false) {
+// 同一组输入分别用一个核组和多个核组运行，检查跨任务复用和核间隔离。
+void RunNpuCase(Runtime &rt, const char *name, const mega_test::Case &c, uint32_t availableCores,
+                void *qkTiling, void *pvTiling, void *workspace, bool benchmark=false) {
     auto ref=mega_test::reference(c);
-    std::vector<Stage1Config> tasks;
-    for (int q=0; q<c.n; ++q)
-        for (int h=0; h<HEADS; h+=HEAD_TILE) tasks.push_back(MakeConfig(c,q,h,0));
+    std::vector<TaskConfig> tasks;
+    for (int query=0; query<c.n; ++query)
+        for (int head=0; head<HEADS; head+=HEAD_TILE)
+            tasks.push_back(MakeConfig(c,query,head,0));
     uint32_t taskCount=uint32_t(tasks.size());
     uint32_t maxBlocks=std::min(taskCount,availableCores);
     check(maxBlocks>0,"No available AIC cores");
-    DeviceBuffer<uint16_t> q(c.q), qLoaded(maxBlocks*Q_ELEMS), qRope(maxBlocks*Q_ELEMS);
-    DeviceBuffer<uint16_t> kv(maxBlocks*KV_ELEMS), prob(maxBlocks*SCORE_ELEMS);
+    DeviceBuffer<uint16_t> q(c.q);
     DeviceBuffer<uint8_t> main(c.main.bytes), extra(c.extra.bytes), packed(size_t(c.n)*HEADS*DIM);
-    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices), valid(maxBlocks*KV_TILE);
-    DeviceBuffer<float> rope(c.cos_sin), sink(c.sink), scores(maxBlocks*SCORE_ELEMS);
-    DeviceBuffer<float> pv(maxBlocks*Q_ELEMS), output(maxBlocks*Q_ELEMS);
-    DeviceBuffer<float> rowMax(maxBlocks*HEAD_TILE), rowSum(maxBlocks*HEAD_TILE), lse(size_t(c.n)*HEADS);
+    DeviceBuffer<int32_t> ids(c.indices), extraIds(c.extra_indices);
+    DeviceBuffer<float> rope(c.cos_sin), sink(c.sink), lse(size_t(c.n)*HEADS);
     DeviceBuffer<uint32_t> scales(256*c.sfstride);
-    DeviceBuffer<int32_t> status(std::vector<int32_t>(taskCount*8,-1));
-    DeviceBuffer<Stage1Config> configs(tasks);
-    Stage1Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data};
-    Stage1Output scratch{qLoaded.data,qRope.data,kv.data,valid.data,scores.data,status.data};
-    Stage2Output online{prob.data,pv.data,output.data,rowMax.data,rowSum.data};
-    Stage3Output final{packed.data,scales.data,lse.data,c.sfstride};
-    std::fprintf(stderr,"NPU stage4: serial baseline, %u tasks\n",taskCount);
-    for (uint32_t task=0; task<taskCount; ++task) {
-        auto serialScratch=scratch;
-        serialScratch.status=status.data+task*8;
-        launch_mega_attn_stage3(in,serialScratch,online,c.use_sink?sink.data:nullptr,final,
-                              configs.data+task,qkTiling,pvTiling,workspace,rt.stream);
-    }
-    AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"stage4 serial baseline synchronize");
-    auto serialStatus=status.Download();
-    for (uint32_t task=0; task<taskCount; ++task)
-        check(serialStatus[task*8]==0,"Stage3 baseline incomplete");
-    auto expectedPacked=packed.Download();
-    auto expectedScales=scales.Download();
-    auto expectedLse=lse.Download();
-
+    DeviceBuffer<TaskConfig> configs(tasks);
+    DeviceBuffer<uint8_t> scratch(ScratchBytes(maxBlocks));
+    Input in{q.data,main.data,extra.data,ids.data,extraIds.data,rope.data,c.use_sink?sink.data:nullptr};
+    Output out{packed.data,scales.data,lse.data,c.sfstride};
+    auto launch=[&](uint32_t blocks) {
+        launch_mega_attn_v1(in,out,configs.data,taskCount,blocks,scratch.data,
+                           qkTiling,pvTiling,workspace,rt.stream);
+    };
     std::vector<uint32_t> blockCounts{1};
     for (uint32_t blocks: {2u,5u,maxBlocks})
         if (blocks<=maxBlocks && std::find(blockCounts.begin(),blockCounts.end(),blocks)==blockCounts.end())
             blockCounts.push_back(blocks);
+    std::vector<uint8_t> serialPacked;
+    std::vector<uint32_t> serialScales;
+    std::vector<float> serialLse;
     for (uint32_t blocks:blockCounts) {
-      std::vector<uint8_t> vectorPacked;
-      std::vector<uint32_t> vectorScales;
-      std::vector<float> vectorLse;
-      for (Stage4Mode mode: {Stage4Mode::Reference,Stage4Mode::Vector,Stage4Mode::Pipeline}) {
         packed.Upload(std::vector<uint8_t>(packed.count,0xa5));
         scales.Upload(std::vector<uint32_t>(scales.count,0xa5a5a5a5u));
         lse.Upload(std::vector<float>(lse.count,NAN));
-        status.Upload(std::vector<int32_t>(status.count,-1));
-        std::fprintf(stderr,"NPU stage4 [%s]: tasks=%u groups=%u mode=%d\n",name,taskCount,blocks,int(mode));
-        launch_mega_attn_stage4(in,scratch,online,c.use_sink?sink.data:nullptr,final,taskCount,blocks,
-                              configs.data,qkTiling,pvTiling,workspace,rt.stream,mode);
-        auto sync=aclrtSynchronizeStreamWithTimeout(rt.stream,30000);
-        if (sync!=ACL_SUCCESS) std::fprintf(stderr,"NPU stage4 sync failed: %d\n",int(sync));
-        AclCheck(sync,"stage4 synchronize");
-        auto gotStatus=status.Download();
-        if (gotStatus[0]==int(Step::ProcessTasks))
-            throw std::runtime_error("TODO stage4: ProcessTasks/BindTask");
-        for (uint32_t task=0; task<taskCount; ++task) {
-            if (gotStatus[task*8]!=0)
-                throw std::runtime_error("Stage4 task "+std::to_string(task)+": "+StepName(gotStatus[task*8]));
-        }
+        std::fprintf(stderr,"NPU v1 [%s]: tasks=%u groups=%u\n",name,taskCount,blocks);
+        launch(blocks);
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"v1 synchronize");
         auto actualPacked=packed.Download();
         auto actualScales=scales.Download();
         auto actualLse=lse.Download();
-        if (mode==Stage4Mode::Reference) {
-            check(actualPacked==expectedPacked,"Multi-core FP8 differs from serial baseline");
-            check(actualScales==expectedScales,"Multi-core scale/padding differs from serial baseline");
-            CompareFloats(actualLse,expectedLse,0,0,"Multi-core LSE");
+        CompareQuantized(c,ref,actualPacked,actualScales,actualLse);
+        if (blocks==1) {
+            serialPacked=actualPacked; serialScales=actualScales; serialLse=actualLse;
         } else {
-            CompareQuantized(c,ref,actualPacked,actualScales,actualLse);
-            if (mode==Stage4Mode::Vector) {
-                vectorPacked=actualPacked; vectorScales=actualScales; vectorLse=actualLse;
-            } else {
-                check(actualPacked==vectorPacked && actualScales==vectorScales,"Prefetch changed output bytes");
-                CompareFloats(actualLse,vectorLse,0,0,"Prefetch LSE");
-            }
+            check(actualPacked==serialPacked,"Multi-core FP8 differs from one group");
+            check(actualScales==serialScales,"Multi-core scales differ from one group");
+            CompareFloats(actualLse,serialLse,0,0,"Multi-core LSE");
         }
-        qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard(); prob.CheckGuard();
-        valid.CheckGuard(); scores.CheckGuard(); pv.CheckGuard(); output.CheckGuard();
-        rowMax.CheckGuard(); rowSum.CheckGuard(); status.CheckGuard();
-        packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
-        std::printf("PASS NPU stage4: %s tasks=%u blocks=%u mode=%d\n",name,taskCount,blocks,int(mode));
-      }
+        scratch.CheckGuard(); packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
+        std::printf("PASS NPU v1: %s tasks=%u blocks=%u\n",name,taskCount,blocks);
     }
     if (benchmark) {
         std::printf("BENCH shape: N=%d heads=%d dim=%d FP8_K=%d FP4_K=%d groups=%u\n",
                     c.n,HEADS,DIM,c.k,c.ek,maxBlocks);
-        MeasureBatch(rt,"serial-stage3",c.n,[&] {
-            for (uint32_t task=0; task<taskCount; ++task) {
-                auto one=scratch; one.status=status.data+task*8;
-                launch_mega_attn_stage3(in,one,online,c.use_sink?sink.data:nullptr,final,
-                                      configs.data+task,qkTiling,pvTiling,workspace,rt.stream);
-            }
-        });
-        auto measure=[&](const char *label,Stage4Mode mode,uint32_t blocks) {
-            MeasureBatch(rt,label,c.n,[&] {
-                launch_mega_attn_stage4(in,scratch,online,c.use_sink?sink.data:nullptr,final,taskCount,blocks,
-                                      configs.data,qkTiling,pvTiling,workspace,rt.stream,mode);
-            });
-            CompareQuantized(c,ref,packed.Download(),scales.Download(),lse.Download());
-            auto done=status.Download();
-            for (uint32_t task=0; task<taskCount; ++task) check(done[task*8]==0,"Timed task incomplete");
-        };
-        measure("parallel-reference",Stage4Mode::Reference,maxBlocks);
-        measure("vector-sync",Stage4Mode::Vector,maxBlocks);
-        measure("pipeline-1group",Stage4Mode::Pipeline,1);
-        measure("pipeline",Stage4Mode::Pipeline,maxBlocks);
+        MeasureBatch(rt,"v1",c.n,[&] { launch(maxBlocks); });
+        CompareQuantized(c,ref,packed.Download(),scales.Download(),lse.Download());
     }
     q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
-    rope.CheckGuard(); sink.CheckGuard(); configs.CheckGuard();
-    qLoaded.CheckGuard(); qRope.CheckGuard(); kv.CheckGuard(); prob.CheckGuard();
-    valid.CheckGuard(); scores.CheckGuard(); pv.CheckGuard(); output.CheckGuard();
-    rowMax.CheckGuard(); rowSum.CheckGuard(); status.CheckGuard();
+    rope.CheckGuard(); sink.CheckGuard(); configs.CheckGuard(); scratch.CheckGuard();
     packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
-}
-
-
-void MultiCoreNpuTests(Runtime &rt, uint32_t availableCores,
-                       void *qkTiling, void *pvTiling, void *workspace) {
-    auto run=[&](const char *name,const mega_test::Case &c,bool bench=false) {
-        RunStage4Case(rt,name,c,availableCores,qkTiling,pvTiling,workspace,bench);
-    };
-    mega_test::Case mixed(3,72,121,65,17);
-    run("mixed/tail/empty",mixed);
-    mixed.lengths[2]=0; mixed.use_sink=false;
-    run("empty prefix + null sink",mixed);
-    mixed.lengths[2]=mixed.k; mixed.extra_lengths[2]=0;
-    run("empty suffix",mixed);
-    mega_test::Case small(1,8,9,5);
-    for (int h=0; h<HEADS; ++h) {
-        const float sinks[4]={INFINITY,-INFINITY,10000.0f,-10000.0f};
-        small.sink[h]=sinks[h%4];
-    }
-    run("finite/infinite sinks",small);
-    small.main.pack(std::vector<float>(small.main.decoded.size(),0));
-    small.extra.pack(std::vector<float>(small.extra.decoded.size(),0));
-    run("single tile + zero output",small);
-    mega_test::Case rising(1,128,65,5);
-    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
-    rising.main.pack(std::vector<float>(rising.main.decoded.size(),.5f));
-    rising.extra.pack(std::vector<float>(rising.extra.decoded.size(),.75f));
-    run("rising maximum + large scores",rising);
-    mega_test::Case throughput(8,128,65,65,17);
-    std::fill(throughput.lengths.begin(),throughput.lengths.end(),throughput.k);
-    std::fill(throughput.extra_lengths.begin(),throughput.extra_lengths.end(),throughput.ek);
-    run("full batch",throughput,true);
 }
 
 void NpuTests() {
     Runtime rt;
-    std::fprintf(stderr, "NPU: query platform\n");
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     check(platform != nullptr,"Cannot get Ascend platform");
-    std::fprintf(stderr, "NPU: create and upload tiling\n");
-    DeviceBuffer<uint8_t> tiling(MakeCubeTiling(*platform));
-    std::fprintf(stderr, "NPU: allocate workspace\n");
+    DeviceBuffer<uint8_t> qkTiling(MakeCubeTiling(*platform,false));
+    DeviceBuffer<uint8_t> pvTiling(MakeCubeTiling(*platform,true));
     DeviceBuffer<uint8_t> workspace(platform->GetLibApiWorkSpaceSize());
-    std::fprintf(stderr, "NPU: generate test inputs\n");
-    mega_test::Case c(3,72,121,65,17);
-    RunCase(rt,"FP8",c,MakeConfig(c,2,0,0),tiling.data,workspace.data);
-    RunCase(rt,"mixed FP8/FP4",c,MakeConfig(c,2,16,64),tiling.data,workspace.data);
-    RunCase(rt,"FP4",c,MakeConfig(c,2,32,128),tiling.data,workspace.data);
-    RunCase(rt,"tail",c,MakeConfig(c,2,48,192),tiling.data,workspace.data);
-    RunCase(rt,"empty",c,MakeConfig(c,0,0,0),tiling.data,workspace.data);
-    RunCase(rt,"short length",c,MakeConfig(c,1,0,0),tiling.data,workspace.data);
-    RunCase(rt,"short extra length",c,MakeConfig(c,1,16,64),tiling.data,workspace.data);
-    mega_test::Case small(1,8,9,5);
-    RunCase(rt,"small page + mixed tail",small,MakeConfig(small,0,0,0),tiling.data,workspace.data);
-    std::puts("PASS: stage 1 regression (8 cases)");
-    // 用户 UB 约 153 KiB；QK/PV 各限 16 KiB，合计不超过 910B 的 192 KiB。
-    DeviceBuffer<uint8_t> qkTiling(MakeCubeTiling(*platform,false,16*1024));
-    DeviceBuffer<uint8_t> pvTiling(MakeCubeTiling(*platform,true,16*1024));
-    auto run = [&](const char *name, const mega_test::Case &input, int query, int head) {
-        RunOnlineCase(rt,name,input,MakeConfig(input,query,head,0),
-                      qkTiling.data,pvTiling.data,workspace.data);
-    };
-    run("mixed + tail",c,2,0);
-    run("short lengths",c,1,16);
-    run("all empty",c,0,32);
-    c.lengths[2]=0;
-    run("empty prefix then FP4",c,2,48);
-    c.lengths[2]=13; c.extra_lengths[2]=0;
-    run("empty suffix after FP8",c,2,0);
-    c.lengths[2]=1;
-    run("single valid KV",c,2,16);
-    run("single tile + small pages",small,0,0);
-    mega_test::Case rising(1,128,65,5);
-    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(.125f));
-    rising.main.pack(std::vector<float>(rising.main.decoded.size(),.5f));
-    rising.extra.pack(std::vector<float>(rising.extra.decoded.size(),.75f));
-    run("maximum rises in later tile",rising,0,0);
-    std::fill(rising.q.begin(),rising.q.end(),mega_test::bf16(16));
-    run("large positive scores",rising,0,0);
-    std::puts("PASS: stage 2 regression (9 cases)");
-    FinalNpuTests(rt,qkTiling.data,pvTiling.data,workspace.data);
-    std::puts("PASS: stage 3 complete output (sink/LSE/inverse RoPE/FP8)");
-    MultiCoreNpuTests(rt,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,workspace.data);
-    qkTiling.CheckGuard(); pvTiling.CheckGuard();
-    tiling.CheckGuard(); workspace.CheckGuard();
+    ForEachCase([&](const char *name, const mega_test::Case &c, bool bench=false) {
+        RunNpuCase(rt,name,c,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,workspace.data,bench);
+    });
+    qkTiling.CheckGuard(); pvTiling.CheckGuard(); workspace.CheckGuard();
 }
 } // namespace
 #endif
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     try {
         OracleTests();
         OnlineOracleTests();
         FinalOracleTests();
 #ifdef MEGA_ASCEND_CPU_ONLY
-        std::puts("CPU oracle only: device execution NOT tested; run the NPU build for stage 1-4 and benchmarks.");
+        ForEachCase([](const char *name, const mega_test::Case &c, bool = false) {
+            auto ref=mega_test::reference(c);
+            for (float x:ref.out) check(std::isfinite(x),"Nonfinite CPU reference output");
+            for (int q=0; q<c.n; ++q) for (int h=0; h<HEADS; h+=HEAD_TILE)
+                (void)MakeConfig(c,q,h,0);
+            std::printf("PASS CPU fixture: %s\n",name);
+        });
+        std::puts("CPU oracle only: device execution NOT tested.");
 #else
         NpuTests();
-        std::puts("PASS: stage 4 vector/pipeline correctness and benchmark complete");
+        std::puts("PASS: v1 complete operator correctness and benchmark");
 #endif
         return 0;
     } catch (const std::exception &e) {
