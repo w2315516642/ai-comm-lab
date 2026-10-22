@@ -38,14 +38,30 @@ include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
 # 每个版本独立生成混合核元数据，避免 CANN 9.0 的同源多入口编号问题。
 ascendc_library(mega_attn_kernel STATIC megaAttn_v1.cpp)
 ascendc_library(mega_attn_kernel_v2 STATIC megaAttn_v2.cpp)
+ascendc_library(mega_attn_kernel_v3 STATIC megaAttn_v3.cpp)
+ascendc_library(mega_attn_kernel_v4 STATIC megaAttn_v4.cpp)
+ascendc_library(mega_attn_kernel_v4_merge STATIC megaAttn_v4_merge.cpp)
+ascendc_library(mega_attn_kernel_v5 STATIC megaAttn_v5.cpp)
+# v5 保持 v4 的分片输出格式，复用已经验证的合并核。
+target_link_libraries(mega_attn_kernel_v5 PUBLIC mega_attn_kernel_v4_merge)
 # 让启动封装初始化 Matmul 通信区并通知 AIV；workspace 必须是核函数最后一个参数。
 ascendc_compile_definitions(mega_attn_kernel PRIVATE HAVE_WORKSPACE)
 ascendc_compile_definitions(mega_attn_kernel_v2 PRIVATE HAVE_WORKSPACE)
+ascendc_compile_definitions(mega_attn_kernel_v3 PRIVATE HAVE_WORKSPACE)
+ascendc_compile_definitions(mega_attn_kernel_v4 PRIVATE HAVE_WORKSPACE)
+ascendc_compile_definitions(mega_attn_kernel_v5 PRIVATE HAVE_WORKSPACE)
 target_include_directories(bench_megaAttn PRIVATE
     "${ASCEND_CANN_PACKAGE_PATH}/include"
     "${ASCEND_CANN_PACKAGE_PATH}/include/experiment")
 target_link_directories(bench_megaAttn PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
 target_compile_definitions(bench_megaAttn PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
-target_link_libraries(bench_megaAttn PRIVATE mega_attn_kernel mega_attn_kernel_v2 ascendcl
+target_link_libraries(bench_megaAttn PRIVATE mega_attn_kernel mega_attn_kernel_v2 mega_attn_kernel_v3 mega_attn_kernel_v4 mega_attn_kernel_v4_merge mega_attn_kernel_v5 ascendcl
     tiling_api platform register graph_base ascendalog dl)
 set_target_properties(bench_megaAttn PROPERTIES BUILD_RPATH "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+
+ascendc_library(mega_attn_kernel_v6 STATIC megaAttn_v6.cpp)
+ascendc_library(mega_attn_kernel_v6_merge STATIC megaAttn_v6_merge.cpp)
+ascendc_compile_definitions(mega_attn_kernel_v6 PRIVATE HAVE_WORKSPACE)
+target_link_libraries(mega_attn_kernel_v6 PUBLIC mega_attn_kernel_v6_merge)
+
+target_link_libraries(bench_megaAttn PRIVATE mega_attn_kernel_v6)

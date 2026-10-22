@@ -8,12 +8,14 @@ constexpr int HEADS=64, DIM=512, ROPE_DIM=64, KV_TILE=64;
 constexpr int SCORE_ELEMS=HEADS*KV_TILE, RAW_ROW_BYTES=544;
 constexpr float SCORE_SCALE=mega_ascend_v1::SCORE_SCALE;
 constexpr float RESCALE_DELTA=4.1588830833596715f; // ln(64)，指数权重保持在 BF16 可表示范围内
-constexpr int MATMUL_UB_BYTES=2048;
+// CANN 9.0 / 910B 在 UB 的最后 8 KiB 使用内部临时区，Select 等 API 会写入。
+constexpr int SDK_UB_RESERVE=8*1024, STATE_BYTES=1408;
+constexpr int MATMUL_UB_BYTES=0; // TSCM/NZ 输入、GM 输出的这两份 tiling 无需 UB 转换缓存
 // raw KV 与 scores/P 的生命周期互斥，复用同一段 UB；work 也用于分批读回 PV。
 constexpr int ARENA_BYTES=KV_TILE*RAW_ROW_BYTES;
 constexpr int USER_UB_BYTES=HEADS*DIM*4+ARENA_BYTES+5*DIM*4+DIM*2+
-                            3*DIM*4+128*4+64+528*4+2048+192*4;
-static_assert(USER_UB_BYTES+2*MATMUL_UB_BYTES<=192*1024);
+                            3*DIM*4+128*4+64+528*4+STATE_BYTES+192*4;
+static_assert(USER_UB_BYTES+2*MATMUL_UB_BYTES+SDK_UB_RESERVE<=192*1024);
 constexpr uint64_t SCRATCH_PER_CORE=(SCORE_ELEMS+HEADS*DIM)*4;
 constexpr uint64_t ScratchBytes(uint32_t blocks) { return blocks*SCRATCH_PER_CORE; }
 
@@ -53,7 +55,7 @@ constexpr uint32_t E8M0Bits(uint8_t code) {
 // Q/KV/P 使用 TSCM；两份 KV 的 L1 缓冲共 128 KiB，全部用户 L1 共 200 KiB。
 // qk_tiling: A=TSCM/NZ BF16，B=TSCM/NZ BF16 转置，C=GM/ND FP32，形状 64x64x512。
 // pv_tiling: A=TSCM/NZ BF16，B=TSCM/NZ BF16 不转置，C=GM/ND FP32，形状 64x512x64。
-// 两个 Matmul 的 UB 预算各 2 KiB，L1 预算各 64 KiB；scratch 为 ScratchBytes(block_num)。
+// 两份 tiling 的 shareUbSize 必须为 0，L1 预算各 64 KiB；scratch 为 ScratchBytes(block_num)。
 // configs/profiles 均为设备地址；profiles 可为 nullptr，关闭诊断计时。
 // block_num<=min(query_count,可用 AIC 核数)，各配置 query 不重复，索引由调用方保证合法。
 extern "C" void launch_mega_attn_v2(

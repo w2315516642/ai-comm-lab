@@ -48,7 +48,7 @@ class KernelMegaAttentionV2 {
         pipe->InitBuffer(indexBuf,3*DIM*4+128*4);
         pipe->InitBuffer(maskBuf,64);
         pipe->InitBuffer(lutBuf,528*4);
-        pipe->InitBuffer(stateBuf,2048);
+        pipe->InitBuffer(stateBuf,STATE_BYTES);
         pipe->InitBuffer(ropeBuf,192*4);
         pipe->InitBuffer(qQueue,1,HEADS*DIM*2);
         pipe->InitBuffer(kvQueue,2,KV_TILE*DIM*2);
@@ -364,8 +364,9 @@ class KernelMegaAttentionV2 {
 
     __aicore__ inline void QuantizeRow(const LocalTensor<float>& row,int h) {
         auto abs=Work(0), exp=Work(1), inv=Work(2), temp=Work(3), code=Work(4);
-        auto groupMax=stateBuf.Get<float>()[320], invScales=stateBuf.Get<float>()[352];
-        auto words=stateBuf.Get<uint32_t>()[384];
+        // LSE 已写回，gate 已折入 factor；复用它们的空间，保留 [128,192) 的归一化系数。
+        auto groupMax=stateBuf.Get<float>()[192], invScales=stateBuf.Get<float>()[208];
+        auto words=stateBuf.Get<uint32_t>()[224];
         if (h%4==0) for (int g=0;g<16;++g) words.SetValue(g*8,0);
         Abs(abs,row,DIM); VDone();
         WholeReduceMax(groupMax,abs,32,16,1,1,4,ReduceOrder::ORDER_ONLY_VALUE);

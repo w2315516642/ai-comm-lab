@@ -4,6 +4,10 @@
 #undef MEGA_ATTN_REFERENCE_ONLY
 #include "megaAttn_v1.h"
 #include "megaAttn_v2.h"
+#include "megaAttn_v3.h"
+#include "megaAttn_v4.h"
+#include "megaAttn_v5.h"
+#include "megaAttn_v6.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -310,6 +314,19 @@ void OracleTests() {
 }
 // 穷举设备查表的全部编码，对照原有独立 codec，包含非规格化数和 NaN。
 void V2CodecTests() {
+    for (int byte=0;byte<256;++byte) {
+        uint32_t pair=mega_ascend_v3::Fp4PairBits(uint8_t(byte));
+        for (int j=0;j<2;++j) {
+            float got=std::bit_cast<float>(uint32_t(uint16_t(pair>>(j*16)))<<16);
+            const float table[8]={0,.5f,1,1.5f,2,3,4,6};
+            int code=(byte>>(j*4))&15;
+            float ref=(code&8)?-table[code&7]:table[code&7];
+            check(std::bit_cast<uint32_t>(got)==std::bit_cast<uint32_t>(ref),"v3 FP4 pair table");
+        }
+    }
+    std::printf("PASS CPU v3: FP4 pair table; UB user=%d, reserve=%d bytes\n",
+        mega_ascend_v3::USER_UB_BYTES,mega_ascend_v3::SDK_UB_RESERVE);
+
     for (int code=0;code<256;++code) {
         float got=std::bit_cast<float>(mega_ascend_v2::E4M3Bits(uint8_t(code)));
         float ref=mega_test::e4m3(uint8_t(code));
@@ -326,8 +343,8 @@ void V2CodecTests() {
         check(nz==mega_test::q_offset(0,h,d) && !occupied[nz],"v2 NZ layout");
         occupied[nz]=true;
     }
-    std::printf("PASS CPU v2: exhaustive codec tables; NZ layout; UB=%d+%d bytes, L1=200 KiB\n",
-                mega_ascend_v2::USER_UB_BYTES,2*mega_ascend_v2::MATMUL_UB_BYTES);
+    std::printf("PASS CPU v2: exhaustive codec tables; NZ layout; UB user=%d, SDK reserve=%d bytes, L1=200 KiB\n",
+                mega_ascend_v2::USER_UB_BYTES,mega_ascend_v2::SDK_UB_RESERVE);
 }
 
 template<class F> void ForEachCase(F run) {
@@ -364,7 +381,31 @@ template<class F> void ForEachCase(F run) {
     mega_test::Case throughput(8,128,65,65,17);
     std::fill(throughput.lengths.begin(),throughput.lengths.end(),throughput.k);
     std::fill(throughput.extra_lengths.begin(),throughput.extra_lengths.end(),throughput.ek);
-    run("full batch",throughput,true);
+    run("full batch",throughput);
+    // FP8/FP4 交界跨过四行解码批次与两个 AIV 的第 32 行边界。
+    for (int k:{31,33}) {
+        mega_test::Case boundary(3,40,65,17,100+k);
+        boundary.k=k;
+        for (auto &length:boundary.lengths) length=std::min(length,k);
+        run(k==31?"split boundary 31":"split boundary 33",boundary);
+    }
+    // v6 的 128 列 tile：覆盖格式交界落在边界两侧的情况。
+    for(int k:{127,129}) {
+        mega_test::Case boundary(3,136,257,65,100+k);boundary.k=k;
+        for(auto &length:boundary.lengths)length=std::min(length,k);
+        run(k==127?"split boundary 127":"split boundary 129",boundary);
+    }
+    mega_test::Case reuse(25,24,19,5,37);
+    reuse.k=17;
+    for (auto &length:reuse.lengths) length=std::min(length,17);
+    run("25 queries reuse core groups",reuse);
+    // 有效区之间存在整块空洞，覆盖分片边界两侧的基准合并。
+    mega_test::Case splitGaps(3,264,257,17,91);
+    splitGaps.lengths={1,129,263};splitGaps.extra_lengths={0,1,255};
+    run("split gaps + multiple maxima",splitGaps);
+    // 与 CUDA Graph 用例一致：默认 seed=1，保留生成器的空行、短行与 sink。
+    mega_test::Case aligned(32,128,512,128);
+    run("CUDA aligned",aligned,true);
 }
 
 } // namespace
@@ -376,6 +417,11 @@ template<class F> void ForEachCase(F run) {
 
 namespace {
 void AclCheck(aclError code, const char *op) {
+    // 超时后设备任务可能仍在等待；避免析构释放流时再次无限等待。
+    if (code==507046) {
+        std::fprintf(stderr,"FAIL: %s timed out (507046)\n",op);
+        std::_Exit(2);
+    }
     if (code != ACL_SUCCESS) throw std::runtime_error(std::string(op) +
         " failed: " + std::to_string(code));
 }
@@ -432,25 +478,26 @@ template<class T> struct DeviceBuffer {
     }
 };
 
-// 固定 QK/PV 形状：v1 从 GM 读 ND，v2 从 L1 读 NZ；结果均写 GM。
-std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, bool v2 = false) {
+// 固定 QK/PV 形状：v2 从 L1 读 NZ，其他版本从 GM 读 ND；结果均写 GM。
+std::vector<uint8_t> MakeCubeTiling(platform_ascendc::PlatformAscendC &platform, bool pv = false, bool v2 = false, bool v3 = false, int kvTile = 0) {
     using namespace matmul_tiling;
     MatmulApiTiling api(platform);
-    auto pos=v2?TPosition::TSCM:TPosition::GM;
-    auto format=v2?CubeFormat::NZ:CubeFormat::ND;
+    auto pos=v2&&!v3?TPosition::TSCM:TPosition::GM;
+    auto format=v2&&!v3?CubeFormat::NZ:CubeFormat::ND;
     api.SetAType(pos, format, DataType::DT_BF16, false);
     api.SetBType(pos, format, DataType::DT_BF16, !pv);
     api.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
     api.SetBias(false);
-    int tile=v2?mega_ascend_v2::KV_TILE:KV_TILE;
+    int tile=kvTile?kvTile:(v2?mega_ascend_v2::KV_TILE:KV_TILE);
     int n = pv ? DIM : tile, k = pv ? tile : DIM;
     int heads=v2?HEADS:HEAD_TILE;
     api.SetShape(heads, n, k);
     api.SetOrgShape(heads, n, k);
-    // v2 的用户 L1 占 200 KiB，两个 Matmul 各留 64 KiB；UB 预算见 v2.h。
-    api.SetBufferSpace(v2?64*1024:-1, -1, v2?mega_ascend_v2::MATMUL_UB_BYTES:16*1024);
+    // v2 用户 L1 占 200 KiB；v3 从 GM 读取，两个 Matmul 各可用 128 KiB L1。
+    api.SetBufferSpace(v3?128*1024:(v2?64*1024:-1), -1, v2?mega_ascend_v2::MATMUL_UB_BYTES:16*1024);
     optiling::TCubeTiling tiling;
     check(api.GetTiling(tiling) != -1, pv?"PV tiling failed":"QK tiling failed");
+    if (v2) check(tiling.get_shareUbSize()==0,"optimized Matmul tiling unexpectedly requires UB");
     std::vector<uint8_t> bytes(tiling.GetDataSize());
     tiling.SaveToBuffer(bytes.data(), bytes.size());
     return bytes;
@@ -461,6 +508,7 @@ void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
                       const std::vector<uint8_t> &packed, const std::vector<uint32_t> &scales,
                       const std::vector<float> &lse) {
     auto got=mega_test::unpack_output(packed,scales,c.n,c.sfstride);
+    CompareFloats(lse,ref.lse,.003f,.002f,"reference LSE");
     for (size_t base=0; base<ref.out.size(); base+=32) {
         float amax=0;
         for (int j=0; j<32; ++j) amax=std::max(amax,std::abs(ref.out[base+j]));
@@ -468,10 +516,10 @@ void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
             float want=ref.out[base+j], value=got[base+j];
             float tolerance=.003f+.025f*std::abs(want)+amax/16;
             if (!std::isfinite(value) || std::abs(value-want)>tolerance)
-                throw std::runtime_error("quantized output mismatch at "+std::to_string(base+j));
+                throw std::runtime_error("quantized output mismatch at "+std::to_string(base+j)+
+                    " got="+std::to_string(value)+" want="+std::to_string(want));
         }
     }
-    CompareFloats(lse,ref.lse,.003f,.002f,"reference LSE");
     for (int q=0; q<c.n; ++q) for (int h=0; h<HEADS; ++h) {
         bool zero=(c.lengths[q]==0 && c.extra_lengths[q]==0) || (c.use_sink && c.sink[h]==INFINITY);
         if (zero) for (int d=0; d<DIM; ++d)
@@ -481,7 +529,7 @@ void CompareQuantized(const mega_test::Case &c, const mega_test::Reference &ref,
         check(scales[word*c.sfstride+q]==0xa5a5a5a5u,"Scale padding overwritten");
 }
 
-// 一次样本计时包含 5 个完整 batch；不含分配、H2D、D2H 和 CPU 对拍。
+// 设备事件计时；不含分配、H2D、D2H 和 CPU 对拍。
 struct DeviceTimer {
     aclrtEvent begin=nullptr, end=nullptr;
     DeviceTimer() {
@@ -490,44 +538,67 @@ struct DeviceTimer {
     }
     ~DeviceTimer() { if (end) aclrtDestroyEvent(end); if (begin) aclrtDestroyEvent(begin); }
 };
-template<class F> void MeasureBatch(Runtime &rt,const char *name,int queries,F launch) {
-    constexpr int warmup=2, repeats=5, samples=3;
+template<class F> void MeasureBatch(Runtime &rt,const char *name,int queries,F launch,
+                                    int repeats=5,int samples=3,int warmup=2,int opsPerCall=1) {
+    std::fprintf(stderr,"TIMING %s: warmup=%d, samples=%d, ops/sample=%d\n",
+                 name,warmup,samples,repeats*opsPerCall);
     for (int i=0; i<warmup; ++i) launch();
     AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"benchmark warmup");
     DeviceTimer timer;
-    std::array<float,samples> times{};
+    std::vector<float> times(samples);
     for (int sample=0; sample<samples; ++sample) {
         AclCheck(aclrtRecordEvent(timer.begin,rt.stream),"record begin");
         for (int i=0; i<repeats; ++i) launch();
         AclCheck(aclrtRecordEvent(timer.end,rt.stream),"record end");
         AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"benchmark synchronize");
         AclCheck(aclrtEventElapsedTime(&times[sample],timer.begin,timer.end),"event elapsed time");
-        times[sample]/=repeats;
+        times[sample]/=repeats*opsPerCall;
     }
     std::sort(times.begin(),times.end());
     float ms=times[samples/2];
     check(ms>0 && std::isfinite(ms),"Invalid benchmark duration");
     std::printf("BENCH %-20s batch_us=%10.3f query/s=%12.1f (median of %d x %d)\n",
-                name,ms*1000,double(queries)*1000/ms,samples,repeats);
+                name,ms*1000,double(queries)*1000/ms,samples,repeats*opsPerCall);
 }
 
-// v2 与同一输入的 v1/独立 CPU 参考对拍；核数变化仍须保持逐字节一致。
-void RunV2Case(Runtime &rt,const char *name,const mega_test::Case &c,uint32_t availableCores,
+// Graph 保存启动参数和地址；输入、输出及工作区必须活到最后一次重放完成。
+struct DeviceGraph {
+    aclmdlRI model=nullptr;
+    template<class F> DeviceGraph(aclrtStream stream,F launch) {
+        AclCheck(aclmdlRICaptureBegin(stream,ACL_MODEL_RI_CAPTURE_MODE_GLOBAL),"capture begin");
+        for (int i=0;i<10;++i) launch();
+        AclCheck(aclmdlRICaptureEnd(stream,&model),"capture end");
+    }
+    ~DeviceGraph() { if (model) aclmdlRIDestroy(model); }
+    DeviceGraph(const DeviceGraph&)=delete;
+    DeviceGraph& operator=(const DeviceGraph&)=delete;
+    void Replay(aclrtStream stream) {
+        AclCheck(aclmdlRIExecuteAsync(model,stream),"graph replay");
+    }
+};
+
+// 每版与上一版和独立 CPU 参考对拍；同一版本改变核数仍须逐字节一致。
+void RunOptimizedCase(Runtime &rt,const char *name,const mega_test::Case &c,uint32_t availableCores,
                const Input &in,const Output &out,DeviceBuffer<uint8_t> &packed,
                DeviceBuffer<uint32_t> &scales,DeviceBuffer<float> &lse,
-               void *qkTiling,void *pvTiling,void *workspace,bool benchmark) {
+               void *qkTiling,void *pvTiling,void *workspace,bool benchmark,int version=2,void *tables=nullptr) {
+    bool v3=version>=3,v4=version>=4,v5=version>=5,v6=version==6;
     auto ref=mega_test::reference(c);
-    auto v1Lse=lse.Download();
-    auto v1Output=mega_test::unpack_output(packed.Download(),scales.Download(),c.n,c.sfstride);
+    auto previousLse=lse.Download();
+    auto previousOutput=mega_test::unpack_output(packed.Download(),scales.Download(),c.n,c.sfstride);
     std::vector<mega_ascend_v2::QueryConfig> queries;
     for (int q=0;q<c.n;++q) queries.push_back({q,c.positions[q],c.k,c.ek,c.lengths[q],c.extra_lengths[q],
         c.main.size,c.main.stride,c.extra.size,c.extra.stride,c.istride,c.eistride});
-    uint32_t maxBlocks=std::min(uint32_t(c.n),availableCores);
+    uint32_t maxBlocks=std::min(uint32_t(c.n)*(v4?mega_ascend_v4::KV_SPLITS:1),availableCores);
     DeviceBuffer<mega_ascend_v2::QueryConfig> configs(queries);
-    DeviceBuffer<uint8_t> scratch(mega_ascend_v2::ScratchBytes(maxBlocks));
-    DeviceBuffer<mega_ascend_v2::Profile> profiles(c.n);
+    DeviceBuffer<uint8_t> scratch(v6?mega_ascend_v6::ScratchBytes(maxBlocks,c.n):v4?mega_ascend_v4::ScratchBytes(maxBlocks,c.n):v3?mega_ascend_v3::ScratchBytes(maxBlocks):mega_ascend_v2::ScratchBytes(maxBlocks));
+    DeviceBuffer<mega_ascend_v2::Profile> profiles(c.n*(v4?2*mega_ascend_v4::KV_SPLITS:(v3?2:1)));
     auto launch=[&](uint32_t blocks,mega_ascend_v2::Profile *profile=nullptr) {
-        launch_mega_attn_v2(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,rt.stream,profile);
+        if (v6) launch_mega_attn_v6(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,tables,rt.stream,profile);
+        else if (v5) launch_mega_attn_v5(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,tables,rt.stream,profile);
+        else if (v4) launch_mega_attn_v4(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,tables,rt.stream,profile);
+        else if (v3) launch_mega_attn_v3(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,tables,rt.stream,profile);
+        else launch_mega_attn_v2(in,out,configs.data,c.n,blocks,scratch.data,qkTiling,pvTiling,workspace,rt.stream,profile);
     };
     std::vector<uint32_t> blockCounts{1};
     for (uint32_t n:{2u,5u,maxBlocks})
@@ -539,42 +610,69 @@ void RunV2Case(Runtime &rt,const char *name,const mega_test::Case &c,uint32_t av
         packed.Upload(std::vector<uint8_t>(packed.count,0xa5));
         scales.Upload(std::vector<uint32_t>(scales.count,0xa5a5a5a5u));
         lse.Upload(std::vector<float>(lse.count,NAN));
-        std::fprintf(stderr,"NPU v2 [%s]: queries=%d groups=%u\n",name,c.n,blocks);
+        std::fprintf(stderr,"NPU v%d [%s]: queries=%d groups=%u\n",version,name,c.n,blocks);
         launch(blocks);
-        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"v2 synchronize");
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),v6?"v6 synchronize":v5?"v5 synchronize":v4?"v4 synchronize":v3?"v3 synchronize":"v2 synchronize");
         auto data=packed.Download(); auto sf=scales.Download(); auto ls=lse.Download();
         CompareQuantized(c,ref,data,sf,ls);
-        CompareFloats(ls,v1Lse,.003f,.002f,"v2 vs v1 LSE");
+        CompareFloats(ls,previousLse,.003f,.002f,v6?"v6 vs v5 LSE":v5?"v5 vs v4 LSE":v4?"v4 vs v3 LSE":v3?"v3 vs v2 LSE":"v2 vs v1 LSE");
         auto values=mega_test::unpack_output(data,sf,c.n,c.sfstride);
         for (size_t base=0;base<values.size();base+=32) {
             float amax=0;
             for (int j=0;j<32;++j) amax=std::max(amax,std::abs(ref.out[base+j]));
             for (int j=0;j<32;++j)
-                check(std::abs(values[base+j]-v1Output[base+j])<=.006f+.05f*std::abs(ref.out[base+j])+amax/8,
-                      "v2 vs v1 quantized output");
+                check(std::abs(values[base+j]-previousOutput[base+j])<=.006f+.05f*std::abs(ref.out[base+j])+amax/8,
+                      v6?"v6 vs v5 quantized output":v5?"v5 vs v4 quantized output":v4?"v4 vs v3 quantized output":v3?"v3 vs v2 quantized output":"v2 vs v1 quantized output");
         }
         if (blocks==1) { serialPacked=data; serialScales=sf; serialLse=ls; }
         else {
-            check(data==serialPacked && sf==serialScales,"v2 changed with block count");
-            CompareFloats(ls,serialLse,0,0,"v2 multi-core LSE");
+            check(data==serialPacked && sf==serialScales,v6?"v6 changed with block count":v5?"v5 changed with block count":v4?"v4 changed with block count":v3?"v3 changed with block count":"v2 changed with block count");
+            CompareFloats(ls,serialLse,0,0,v6?"v6 multi-core LSE":v5?"v5 multi-core LSE":v4?"v4 multi-core LSE":v3?"v3 multi-core LSE":"v2 multi-core LSE");
         }
         packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard(); scratch.CheckGuard();
-        std::printf("PASS NPU v2: %s queries=%d groups=%u\n",name,c.n,blocks);
+        std::printf("PASS NPU v%d: %s queries=%d groups=%u\n",version,name,c.n,blocks);
     }
     if (benchmark) {
-        std::printf("BENCH v2: same input as v1; queries=%d groups=%u, 64 heads/group\n",c.n,maxBlocks);
-        MeasureBatch(rt,"v2",c.n,[&] { launch(maxBlocks); });
+        std::printf("BENCH v%d: queries=%d groups=%u, AIV/group=%d\n",version,c.n,maxBlocks,v3?2:1);
+        MeasureBatch(rt,v6?"v6 ordinary":v5?"v5 ordinary":v4?"v4 ordinary":v3?"v3 ordinary":"v2 ordinary",c.n,[&] { launch(maxBlocks); },10,30,3);
+        {
+            DeviceGraph graph(rt.stream,[&] { launch(maxBlocks); });
+            packed.Upload(std::vector<uint8_t>(packed.count,0xa5));
+            scales.Upload(std::vector<uint32_t>(scales.count,0xa5a5a5a5u));
+            lse.Upload(std::vector<float>(lse.count,NAN));
+            // 一次 replay 执行 10 次完整算子调用（v4/v5/v6 每次含两个 kernel）；预热一次，采样 30 次，耗时除以 10。
+            MeasureBatch(rt,v6?"v6 ACL Graph":v5?"v5 ACL Graph":v4?"v4 ACL Graph":v3?"v3 ACL Graph":"v2 ACL Graph",c.n,[&] { graph.Replay(rt.stream); },1,30,1,10);
+            check(packed.Download()==serialPacked && scales.Download()==serialScales,v6?"v6 graph changed outputs":v5?"v5 graph changed outputs":v4?"v4 graph changed outputs":v3?"v3 graph changed outputs":"v2 graph changed outputs");
+            CompareFloats(lse.Download(),serialLse,0,0,v6?"v6 graph LSE":v5?"v5 graph LSE":v4?"v4 graph LSE":v3?"v3 graph LSE":"v2 graph LSE");
+
+            // 地址不变、内容改变，验证重放实际读取新输入，而非留下旧结果。
+            auto changed=c;
+            for (auto &value:changed.q) value=mega_test::bf16(0);
+            AclCheck(aclrtMemcpy(const_cast<uint16_t*>(in.q),changed.q.size()*sizeof(uint16_t),
+                changed.q.data(),changed.q.size()*sizeof(uint16_t),ACL_MEMCPY_HOST_TO_DEVICE),"graph update Q");
+            graph.Replay(rt.stream);
+            AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"graph changed input synchronize");
+            CompareQuantized(changed,mega_test::reference(changed),packed.Download(),scales.Download(),lse.Download());
+            AclCheck(aclrtMemcpy(const_cast<uint16_t*>(in.q),c.q.size()*sizeof(uint16_t),
+                c.q.data(),c.q.size()*sizeof(uint16_t),ACL_MEMCPY_HOST_TO_DEVICE),"graph restore Q");
+            graph.Replay(rt.stream);
+            AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"graph restored input synchronize");
+            check(packed.Download()==serialPacked && scales.Download()==serialScales,v6?"v6 graph restore changed outputs":v5?"v5 graph restore changed outputs":v4?"v4 graph restore changed outputs":v3?"v3 graph restore changed outputs":"v2 graph restore changed outputs");
+            CompareFloats(lse.Download(),serialLse,0,0,v6?"v6 graph restored LSE":v5?"v5 graph restored LSE":v4?"v4 graph restored LSE":v3?"v3 graph restored LSE":"v2 graph restored LSE");
+            std::printf("PASS NPU v%d ACL Graph: replay, changed input, restored input\n",version);
+        }
         // 与无计时版本逐字节比较，保证诊断开关没有改变结果。
         launch(maxBlocks,profiles.data);
-        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),"v2 profile synchronize");
-        check(packed.Download()==serialPacked && scales.Download()==serialScales,"v2 profiling changed outputs");
-        CompareFloats(lse.Download(),serialLse,0,0,"v2 profiling LSE");
+        AclCheck(aclrtSynchronizeStreamWithTimeout(rt.stream,30000),v6?"v6 profile synchronize":v5?"v5 profile synchronize":v4?"v4 profile synchronize":v3?"v3 profile synchronize":"v2 profile synchronize");
+        check(packed.Download()==serialPacked && scales.Download()==serialScales,v6?"v6 profiling changed outputs":v5?"v5 profiling changed outputs":v4?"v4 profiling changed outputs":v3?"v3 profiling changed outputs":"v2 profiling changed outputs");
+        CompareFloats(lse.Download(),serialLse,0,0,v6?"v6 profiling LSE":v5?"v5 profiling LSE":v4?"v4 profiling LSE":v3?"v3 profiling LSE":"v2 profiling LSE");
         auto samples=profiles.Download();
-        const char *labels[]={"query","prepare-kv","wait-qk/load","softmax","wait-pv","accumulate","finish","total"};
-        std::puts("PROFILE v2: AIV cycles/query, includes waits; asynchronous work overlaps; excludes InitTables");
+        const char *labels[]={"query","prepare-kv",v3?"qk launch/wait/load":"wait-qk/load","softmax",v3?"pv launch/wait":"wait-pv","accumulate",v4?"store-partial":"finish","total"};
+        if(v4) std::puts("Split profile excludes merge/quantization; benchmark includes both kernels.");
+        std::printf("PROFILE v%d: cycles/AIV task, includes waits and overlaps; excludes InitTables\n",version);
         for (int part=0;part<mega_ascend_v2::ProfileCount;++part) {
             double sum=0; for (const auto &sample:samples) sum+=sample.cycles[part];
-            std::printf("  %-14s %.0f\n",labels[part],sum/c.n);
+            std::printf("  %-14s %.0f\n",labels[part],sum/samples.size());
         }
     }
     configs.CheckGuard(); scratch.CheckGuard(); profiles.CheckGuard();
@@ -582,7 +680,7 @@ void RunV2Case(Runtime &rt,const char *name,const mega_test::Case &c,uint32_t av
 
 // 同一组输入分别用一个核组和多个核组运行，检查跨任务复用和核间隔离。
 void RunNpuCase(Runtime &rt, const char *name, const mega_test::Case &c, uint32_t availableCores,
-                void *qkTiling, void *pvTiling, void *v2Qk, void *v2Pv, void *workspace, bool benchmark=false) {
+                void *qkTiling, void *pvTiling, void *v2Qk, void *v2Pv, void *v3Qk, void *v3Pv, void *v3Tables, void *v6Qk, void *v6Pv, void *workspace, bool benchmark=false) {
     auto ref=mega_test::reference(c);
     std::vector<TaskConfig> tasks;
     for (int query=0; query<c.n; ++query)
@@ -635,10 +733,15 @@ void RunNpuCase(Runtime &rt, const char *name, const mega_test::Case &c, uint32_
     if (benchmark) {
         std::printf("BENCH shape: N=%d heads=%d dim=%d FP8_K=%d FP4_K=%d groups=%u\n",
                     c.n,HEADS,DIM,c.k,c.ek,maxBlocks);
-        MeasureBatch(rt,"v1",c.n,[&] { launch(maxBlocks); });
-        CompareQuantized(c,ref,packed.Download(),scales.Download(),lse.Download());
+        std::puts("TIMING: v5/v6 only; v1-v4 retain all numerical regression cases.");
     }
-    RunV2Case(rt,name,c,availableCores,in,out,packed,scales,lse,v2Qk,v2Pv,workspace,benchmark);
+    // 旧版保留数值回归；v2 连续异步启动曾超时，性能主线只比较 v5/v6。
+    RunOptimizedCase(rt,name,c,availableCores,in,out,packed,scales,lse,v2Qk,v2Pv,workspace,false);
+    // 上一轮 v2 输出成为 v3 的额外对照，独立 CPU 参考仍然同时检查。
+    RunOptimizedCase(rt,name,c,availableCores,in,out,packed,scales,lse,v3Qk,v3Pv,workspace,false,3,v3Tables);
+    RunOptimizedCase(rt,name,c,availableCores,in,out,packed,scales,lse,v3Qk,v3Pv,workspace,false,4,v3Tables);
+    RunOptimizedCase(rt,name,c,availableCores,in,out,packed,scales,lse,v3Qk,v3Pv,workspace,benchmark,5,v3Tables);
+    RunOptimizedCase(rt,name,c,availableCores,in,out,packed,scales,lse,v6Qk,v6Pv,workspace,benchmark,6,v3Tables);
     q.CheckGuard(); main.CheckGuard(); extra.CheckGuard(); ids.CheckGuard(); extraIds.CheckGuard();
     rope.CheckGuard(); sink.CheckGuard(); configs.CheckGuard(); scratch.CheckGuard();
     packed.CheckGuard(); scales.CheckGuard(); lse.CheckGuard();
@@ -652,11 +755,18 @@ void NpuTests() {
     DeviceBuffer<uint8_t> pvTiling(MakeCubeTiling(*platform,true));
     DeviceBuffer<uint8_t> v2Qk(MakeCubeTiling(*platform,false,true));
     DeviceBuffer<uint8_t> v2Pv(MakeCubeTiling(*platform,true,true));
+    // v5 表的前缀与 v3/v4 完全一致，可共享一份只读表。
+    auto lookup=mega_ascend_v5::MakeLookupTables();
+    DeviceBuffer<uint32_t> v3Tables(std::vector<uint32_t>(lookup.words,lookup.words+mega_ascend_v5::TABLE_WORDS));
+    DeviceBuffer<uint8_t> v3Qk(MakeCubeTiling(*platform,false,true,true));
+    DeviceBuffer<uint8_t> v3Pv(MakeCubeTiling(*platform,true,true,true));
+    DeviceBuffer<uint8_t> v6Qk(MakeCubeTiling(*platform,false,true,true,mega_ascend_v6::KV_TILE));
+    DeviceBuffer<uint8_t> v6Pv(MakeCubeTiling(*platform,true,true,true,mega_ascend_v6::KV_TILE));
     DeviceBuffer<uint8_t> workspace(platform->GetLibApiWorkSpaceSize());
     ForEachCase([&](const char *name, const mega_test::Case &c, bool bench=false) {
-        RunNpuCase(rt,name,c,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,v2Qk.data,v2Pv.data,workspace.data,bench);
+        RunNpuCase(rt,name,c,platform->GetCoreNumAic(),qkTiling.data,pvTiling.data,v2Qk.data,v2Pv.data,v3Qk.data,v3Pv.data,v3Tables.data,v6Qk.data,v6Pv.data,workspace.data,bench);
     });
-    qkTiling.CheckGuard(); pvTiling.CheckGuard(); v2Qk.CheckGuard(); v2Pv.CheckGuard(); workspace.CheckGuard();
+    qkTiling.CheckGuard(); pvTiling.CheckGuard(); v2Qk.CheckGuard(); v2Pv.CheckGuard(); v3Qk.CheckGuard(); v3Pv.CheckGuard(); v3Tables.CheckGuard(); v6Qk.CheckGuard(); v6Pv.CheckGuard(); workspace.CheckGuard();
 }
 } // namespace
 #endif
@@ -679,7 +789,7 @@ int main() {
         std::puts("CPU oracle only: device execution NOT tested.");
 #else
         NpuTests();
-        std::puts("PASS: v1/v2 complete operator correctness and benchmark");
+        std::puts("PASS: v1-v6 operator correctness; v5/v6 benchmark and Graph replay");
 #endif
         return 0;
     } catch (const std::exception &e) {
